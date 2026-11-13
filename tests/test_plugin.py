@@ -1,0 +1,221 @@
+"""Tests of the parts of the plugin that do not need OrcaSlicer. Run: python -m unittest -v"""
+import json
+import os
+import sys
+import tempfile
+import unittest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+import tigertag_orca_plugin as plugin  # noqa: E402
+
+FIXTURES = os.path.join(ROOT, "tests", "fixtures")
+
+DB = {
+    "id_brand": {51857: {"id": 51857, "name": "Sunlu"}, 7: {"id": 7, "name": "Acme"}},
+    "id_material": {
+        38219: {"id": 38219, "label": "PLA", "material_type": "PLA", "density": 1.24},
+        500: {"id": 500, "label": "PETG", "material_type": "PETG", "density": 1.27},
+        900: {"id": 900, "label": "Unobtainium", "material_type": "Unobtainium", "density": 2.0},
+    },
+    "id_diameter": {56: {"id": 56, "label": "1.75"}},
+    "id_aspect": {104: {"id": 104, "label": "Basic"}, 105: {"id": 105, "label": "Matte"},
+                  255: {"id": 255, "label": "None"}},
+}
+
+
+def document(**overrides):
+    """An inventory document shaped like the one read from the real account (values changed)."""
+    fields = {
+        "id_type": 142, "id_material": 38219, "id_brand": 51857, "id_aspect1": 104,
+        "series": "PLA+", "name": "Olive Green", "online_color": "#5A6D30FF",
+        "color_r": 90, "color_g": 109, "color_b": 48,
+        "data1": 56, "data2": 190, "data3": 240, "data6": 25, "data7": 65,
+        "measure_gr": 1000, "weight_available": 250, "twin_tag_uid": None,
+        "catalogProduct": {"brand": "Sunlu", "material": "PLA", "series": "PLA+",
+                           "filament": {"diameter": "1.75"}},
+    }
+    fields.update(overrides)
+    return fields
+
+
+def system_names():
+    with open(os.path.join(FIXTURES, "orca_system_filaments.txt"), encoding="utf-8") as handle:
+        return [line.strip() for line in handle if line.strip() and not line.startswith("#")]
+
+
+class FirestoreTest(unittest.TestCase):
+    def test_plain_values(self):
+        typed = {"mapValue": {"fields": {
+            "a": {"integerValue": "5"}, "b": {"stringValue": "x"}, "c": {"nullValue": None},
+            "d": {"arrayValue": {"values": [{"booleanValue": True}]}}, "e": {"arrayValue": {}},
+        }}}
+        self.assertEqual(plugin.firestore_plain(typed), {"a": 5, "b": "x", "c": None, "d": [True], "e": []})
+
+
+class SpoolTest(unittest.TestCase):
+    def test_fields_of_a_catalog_spool(self):
+        spool = plugin.spool_from_document("5301e4ba000001", document(), DB)
+        self.assertEqual(spool["uid"], "5301E4BA000001")
+        self.assertEqual((spool["brand"], spool["material"], spool["series"]), ("Sunlu", "PLA", "PLA+"))
+        self.assertEqual(spool["colour"], "#5A6D30")
+        self.assertEqual(spool["diameter"], "1.75")
+        self.assertEqual(spool["density"], 1.24)
+        self.assertEqual(spool["nozzle"], (190, 240))
+        self.assertEqual(spool["bed"], (25, 65))
+        self.assertEqual((spool["remaining_g"], spool["measure_g"]), (250, 1000))
+
+    def test_spool_without_catalog_uses_the_database(self):
+        fields = document(catalogProduct=None, series="", online_color="", id_brand=7)
+        spool = plugin.spool_from_document("AA", fields, DB)
+        self.assertEqual((spool["brand"], spool["series"], spool["colour"]), ("Acme", "", "#5A6D30"))
+
+    def test_unknown_temperatures_are_none(self):
+        spool = plugin.spool_from_document("AA", document(data2=0, data3=0, data6=70, data7=60), DB)
+        self.assertIsNone(spool["nozzle"])
+        self.assertIsNone(spool["bed"])  # min above max
+
+    def test_deleted_and_other_types_are_dropped(self):
+        self.assertIsNone(plugin.spool_from_document("AA", document(deleted=True), DB))
+        self.assertIsNone(plugin.spool_from_document("AA", document(id_type=173), DB))
+
+    def test_twin_tag_spool_counts_once(self):
+        docs = [("BB", document(twin_tag_uid="aa")), ("AA", document(twin_tag_uid="BB")), ("CC", document())]
+        self.assertEqual([spool["uid"] for spool in plugin.spools_from_documents(docs, DB)], ["AA", "CC"])
+
+
+class PresetTest(unittest.TestCase):
+    def spool(self, **overrides):
+        return plugin.spool_from_document(overrides.pop("uid", "5301E4BA000001"), document(**overrides), DB)
+
+    def test_base_prefers_brand_and_series(self):
+        self.assertEqual(plugin.choose_base(self.spool(), system_names()), "SUNLU PLA+ @System")
+
+    def test_base_falls_back_to_generic_material(self):
+        self.assertEqual(plugin.choose_base(self.spool(id_brand=7, catalogProduct=None, id_material=500,
+                                                       series=""), system_names()), "Generic PETG @System")
+
+    def test_base_uses_the_aspect(self):
+        spool = self.spool(id_brand=7, catalogProduct=None, series="", id_aspect1=105)
+        self.assertEqual(plugin.choose_base(spool, system_names()), "Generic PLA Matte @System")
+
+    def test_no_base_for_an_unknown_material(self):
+        spool = self.spool(id_brand=7, catalogProduct=None, series="", id_material=900)
+        presets, skipped = plugin.build_presets([spool], system_names(), lambda base, key: None, "2026-11-13")
+        self.assertEqual(presets, {})
+        self.assertEqual(len(skipped), 1)
+
+    def test_names_are_unique_and_file_safe(self):
+        spools = [self.spool(uid="11112222640001", name="Black/White"),
+                  self.spool(uid="33334444640001", name="Black/White"),
+                  self.spool(uid="5555666601", name="Sunlu Olive Green"),
+                  self.spool(uid="5555666602", name="Olive Green")]
+        names = plugin.preset_names(spools)
+        self.assertEqual(names["11112222640001"], "Sunlu PLA+ Black-White (1111)")   # same end, start differs
+        self.assertEqual(names["33334444640001"], "Sunlu PLA+ Black-White (3333)")
+        # brand dropped from the colour name; same start, end differs
+        self.assertEqual(names["5555666601"], "Sunlu PLA+ Olive Green (6601)")
+        self.assertEqual(names["5555666602"], "Sunlu PLA+ Olive Green (6602)")
+
+    def test_tigerdata_ids_and_brand_inside_the_series(self):
+        spools = [self.spool(uid="TigerData_17945008581696194"), self.spool(uid="TigerData_17945008630405988"),
+                  self.spool(uid="X1", series="ecoPLA Sunlu", name="Neon Orange")]
+        names = plugin.preset_names(spools)
+        self.assertEqual(names["TIGERDATA_17945008581696194"], "Sunlu PLA+ Olive Green (6194)")
+        self.assertEqual(names["X1"], "Sunlu ecoPLA Neon Orange")
+
+    def test_single_spool_has_no_uid_in_its_name(self):
+        self.assertEqual(plugin.preset_names([self.spool()]), {"5301E4BA000001": "Sunlu PLA+ Olive Green"})
+
+    def test_base_for_a_two_word_brand_and_by_series(self):
+        bambu = self.spool(id_brand=7, catalogProduct={"brand": "Bambu Lab"}, series="PLA Basic")
+        self.assertEqual(plugin.choose_base(bambu, system_names()), "Bambu PLA Basic @System")
+        hf = self.spool(id_brand=7, catalogProduct=None, series="PETG HF", id_material=500)
+        self.assertEqual(plugin.choose_base(hf, system_names()), "Generic PETG HF @System")
+
+    def test_preset_content(self):
+        base = {
+            "nozzle_temperature": "250,250", "nozzle_temperature_initial_layer": "220,220",
+            "nozzle_temperature_range_low": "190,190", "nozzle_temperature_range_high": "230,230",
+            "hot_plate_temp": "70", "cool_plate_temp": "35", "eng_plate_temp": "0",
+            "filament_diameter": "1.75,1.75", "filament_density": "1.26",
+        }
+        preset = plugin.build_preset(self.spool(), "X", "SUNLU PLA+ @System", base.get, "2026-11-13")
+        self.assertEqual(preset["inherits"], "SUNLU PLA+ @System")
+        self.assertEqual(preset["filament_settings_id"], ["X"])
+        self.assertEqual(preset["default_filament_colour"], ["#5A6D30"])
+        self.assertEqual(preset["filament_vendor"], ["Sunlu"])
+        self.assertEqual(preset["filament_diameter"], ["1.75", "1.75"])
+        self.assertEqual(preset["filament_density"], ["1.24"])
+        self.assertEqual(preset["nozzle_temperature_range_low"], ["190", "190"])
+        self.assertEqual(preset["nozzle_temperature_range_high"], ["240", "240"])
+        self.assertEqual(preset["nozzle_temperature"], ["240", "240"])      # clamped from 250
+        self.assertNotIn("nozzle_temperature_initial_layer", preset)        # 220 already fits
+        self.assertEqual(preset["hot_plate_temp"], ["65"])                  # clamped from 70
+        self.assertNotIn("cool_plate_temp", preset)                         # 35 fits
+        self.assertNotIn("eng_plate_temp", preset)                          # 0 = plate not supported
+        self.assertEqual(preset["filament_notes"],
+                         ["TigerTag spool 5301E4BA000001: 250 g of 1000 g left (synced 2026-11-13)."])
+        json.dumps(preset)  # serialisable
+
+
+class BundleTest(unittest.TestCase):
+    def test_write_bundle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = os.path.join(tmp, plugin.BUNDLE_ID)
+            plugin.write_bundle(bundle_dir, {"A": {"name": "A"}, "B": {"name": "B"}}, now=100)
+            plugin.write_bundle(bundle_dir, {"B": {"name": "B"}}, now=200)
+            self.assertEqual(sorted(os.listdir(os.path.join(bundle_dir, "filament"))), ["B.json"])
+            with open(os.path.join(bundle_dir, "bundle_metadata.json"), encoding="utf-8") as handle:
+                metadata = json.load(handle)
+            self.assertEqual(metadata["id"], plugin.BUNDLE_ID)
+            self.assertEqual(metadata["filament_presets"], ["B"])
+            self.assertEqual((metadata["imported_time"], metadata["updated_time"]), (100, 200))
+
+
+class DatabaseTest(unittest.TestCase):
+    def test_cache_is_used_when_the_download_fails(self):
+        rows = {table: [{"id": 1, "label": table}] for table in plugin.DB_TABLES}
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = os.path.join(tmp, "db.json")
+            plugin.load_database(cache, fetch=lambda table: rows[table])
+
+            def offline(table):
+                raise plugin.TigerTagError("offline")
+            db = plugin.load_database(cache, fetch=offline)
+            self.assertEqual(db["id_material"][1]["label"], "id_material")
+            os.remove(cache)
+            with self.assertRaises(plugin.TigerTagError):
+                plugin.load_database(cache, fetch=offline)
+
+
+class AuthenticateTest(unittest.TestCase):
+    def test_password_is_used_once_then_the_refresh_token(self):
+        calls = []
+        saved = (plugin.sign_in_with_password, plugin.refresh_session)
+        plugin.sign_in_with_password = lambda e, p: calls.append("password") or {
+            "uid": "U", "id_token": "I1", "refresh_token": "R1"}
+        plugin.refresh_session = lambda r: calls.append("refresh:" + r) or {
+            "uid": "U", "id_token": "I2", "refresh_token": "R2"}
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, "s.json")
+                session, changed = plugin.authenticate({"email": "a@b.c", "password": "pw"}, path)
+                self.assertEqual(changed, {"email": "a@b.c", "password": ""})
+                session, changed = plugin.authenticate(changed, path)
+                self.assertIsNone(changed)
+                self.assertEqual(session["id_token"], "I2")
+                self.assertEqual(calls, ["password", "refresh:R1"])
+                with open(path, encoding="utf-8") as handle:
+                    stored = json.load(handle)
+                self.assertNotIn("id_token", stored)
+                self.assertEqual(stored["refresh_token"], "R2")
+                with self.assertRaises(plugin.TigerTagError):
+                    plugin.authenticate({"email": "other@b.c", "password": ""}, path)
+        finally:
+            plugin.sign_in_with_password, plugin.refresh_session = saved
+
+
+if __name__ == "__main__":
+    unittest.main()

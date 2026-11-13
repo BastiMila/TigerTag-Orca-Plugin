@@ -1,0 +1,290 @@
+# Instantiable filament presets of OrcaSlicer v2.5.0-rc, resources/profiles/OrcaFilamentLibrary.
+3D-Fuel PET CF @System
+3D-Fuel Pro PCTG @System
+3D-Fuel Pro PCTG ESD @System
+3D-Fuel Pro PCTG Matte @System
+3D-Fuel Pro PCTG Refuel @System
+3D-Fuel Pro PCTG-CF @System
+3D-Fuel Pro PCTG-GF @System
+3D-Fuel Pro PETG @System
+3D-Fuel Pro PETG Refuel @System
+3D-Fuel Standard PLA @System
+3D-Fuel Standard PLA Refuel @System
+3D-Fuel Tough Pro PLA @System
+3D-Fuel Tough Pro Refuel @System
+AliZ PA-CF @System
+AliZ PETG @System
+AliZ PETG-CF @System
+AliZ PETG-Metal @System
+AliZ PLA @System
+Bambu ABS @System
+Bambu ABS-GF @System
+Bambu ASA @System
+Bambu ASA-Aero @System
+Bambu ASA-CF @System
+Bambu PA-CF @System
+Bambu PA6-CF @System
+Bambu PA6-GF @System
+Bambu PAHT-CF @System
+Bambu PC @System
+Bambu PC FR @System
+Bambu PET-CF @System
+Bambu PETG Basic @System
+Bambu PETG HF @System
+Bambu PETG Matte @System
+Bambu PETG Translucent @System
+Bambu PETG-CF @System
+Bambu PLA Aero @System
+Bambu PLA Basic @System
+Bambu PLA Dynamic @System
+Bambu PLA Galaxy @System
+Bambu PLA Glow @System
+Bambu PLA Impact @System
+Bambu PLA Lite @System
+Bambu PLA Marble @System
+Bambu PLA Matte @System
+Bambu PLA Metal @System
+Bambu PLA Pure @System
+Bambu PLA Silk @System
+Bambu PLA Silk+ @System
+Bambu PLA Sparkle @System
+Bambu PLA Tough @System
+Bambu PLA Tough+ @System
+Bambu PLA Translucent @System
+Bambu PLA Wood @System
+Bambu PLA-CF @System
+Bambu PPA-CF @System
+Bambu PVA @System
+Bambu Support For PA PET @System
+Bambu Support For PLA @System
+Bambu Support For PLA-PETG @System
+Bambu Support G @System
+Bambu Support W @System
+Bambu Support for ABS @System
+Bambu TPU 85A @System
+Bambu TPU 90A @System
+Bambu TPU 95A @System
+Bambu TPU 95A HF @System
+Bambu TPU for AMS @System
+COEX ABS @System
+COEX ABS PRIME @System
+COEX ASA PRIME @System
+COEX NYLEX PA6-CF @System
+COEX PCTG PRIME @System
+COEX PETG @System
+COEX PLA @System
+COEX PLA PRIME @System
+COEX PLA+Silk @System
+COEX TPE 30D @System
+COEX TPE 40D @System
+COEX TPE 60D @System
+COEX TPU 60A @System
+DREMC ABS @System
+DREMC ABS+ @System
+DREMC ABS-GF @System
+DREMC ASA @System
+DREMC ASA CF @System
+DREMC ASA GF @System
+DREMC PA12-CF @System
+DREMC PA6-CF @System
+DREMC PET-CF @System
+DREMC PETG @System
+DREMC PLA HS @System
+DREMC PLA+ @System
+DREMC PPA-CF @System
+DREMC TPU 95A @System
+Elas ASA @System
+Elas PETG Basic @System
+Elas PLA Basic @System
+Elas PLA Pro @System
+Elegoo ABS @System
+Elegoo ASA @System
+Elegoo ASA-CF @System
+Elegoo PAHT-CF @System
+Elegoo PC @System
+Elegoo PC-FR @System
+Elegoo PET-CF @System
+Elegoo PETG @System
+Elegoo PETG HF @System
+Elegoo PETG PRO @System
+Elegoo PETG Translucent @System
+Elegoo PETG-CF @System
+Elegoo PETG-GF @System
+Elegoo PLA @System
+Elegoo PLA Basic @System
+Elegoo PLA Galaxy @System
+Elegoo PLA Glow @System
+Elegoo PLA Marble @System
+Elegoo PLA Matte @System
+Elegoo PLA PRO @System
+Elegoo PLA Silk @System
+Elegoo PLA Sparkle @System
+Elegoo PLA Translucent2 @System
+Elegoo PLA Wood @System
+Elegoo PLA+ @System
+Elegoo PLA-CF @System
+Elegoo Rapid PETG @System
+Elegoo Rapid PLA+ @System
+Elegoo Rapid TPU 95A @System
+Elegoo TPU 95A @System
+Eolas Prints ABS @System
+Eolas Prints ASA @System
+Eolas Prints PETG @System
+Eolas Prints PETG Transition @System
+Eolas Prints PETG UV Resistant @System
+Eolas Prints PLA Antibacterial @System
+Eolas Prints PLA High Speed @System
+Eolas Prints PLA INGEO 850 @System
+Eolas Prints PLA INGEO 870 @System
+Eolas Prints PLA Matte @System
+Eolas Prints PLA Neon @System
+Eolas Prints PLA Premium @System
+Eolas Prints PLA Silk @System
+Eolas Prints PLA Transition @System
+Eolas Prints TPU Flex 93A @System
+Eolas Prints TPU Flex D53 @System
+Eolas Prints TPU Flex D60 UV Resistant @System
+Eolas Prints TPU Transition @System
+FDplast ABS @System
+FDplast HIPS @System
+FDplast PETG @System
+FDplast PLA @System
+FDplast SBS @System
+FDplast TPU @System
+FILL3D PA @System
+FILL3D PETG @System
+FILL3D PETG CF @System
+FILL3D PLA Basic @System
+FILL3D PLA Turbo @System
+FILL3D PP @System
+FILL3D PPCF @System
+Fiberon PA12-CF @System
+Fiberon PA6-CF @System
+Fiberon PA6-GF @System
+Fiberon PA612-CF @System
+Fiberon PET-CF @System
+Fiberon PETG-ESD @System
+Fiberon PETG-rCF @System
+FusRock ABS-GF @System
+Generic ABS @System
+Generic ASA @System
+Generic BVOH @System
+Generic CoPE @System
+Generic EVA @System
+Generic HIPS @System
+Generic PA @System
+Generic PA-CF @System
+Generic PC @System
+Generic PCTG @System
+Generic PE @System
+Generic PE-CF @System
+Generic PETG @System
+Generic PETG HF @System
+Generic PETG-CF @System
+Generic PHA @System
+Generic PLA @System
+Generic PLA High Speed @System
+Generic PLA Matte @System
+Generic PLA Silk @System
+Generic PLA-CF @System
+Generic PP @System
+Generic PP-CF @System
+Generic PP-GF @System
+Generic PPA-CF @System
+Generic PPA-GF @System
+Generic PVA @System
+Generic SBS @System
+Generic TPU @System
+Goofoo 90A TPU @System
+Goofoo 95A TPU @System
+Goofoo ABS @System
+Goofoo ASA @System
+Goofoo PA @System
+Goofoo PA-CF @System
+Goofoo PA-GF10 @System
+Goofoo PE @System
+Goofoo PE-CF @System
+Goofoo PETG @System
+Goofoo PETG HF @System
+Goofoo PETG-CF @System
+Goofoo PHA @System
+Goofoo PLA @System
+Goofoo PLA Silk @System
+Goofoo PLA-CF @System
+Goofoo PP @System
+Goofoo PP-CF @System
+Goofoo PP-GF @System
+Goofoo PVA @System
+GreenGate3D PETG @System
+JAYO PETG @System
+JAYO PLA @System
+JAYO PLA Classic @System
+NIT ABS @System
+NIT PETG @System
+NIT PLA @System
+Numakers PLA+ @System
+Overture ABS Basic @System
+Overture ASA @System
+Overture Air PLA @System
+Overture Easy PLA @System
+Overture Matte PLA @System
+Overture PLA @System
+Overture PLA Pro @System
+Overture Rock PLA @System
+Overture Silk PLA @System
+Overture Super PLA+ @System
+Overture TPU @System
+Panchroma CoPE @System
+Panchroma PLA @System
+Panchroma PLA Celestial @System
+Panchroma PLA Galaxy @System
+Panchroma PLA Glow @System
+Panchroma PLA Luminous @System
+Panchroma PLA Marble @System
+Panchroma PLA Matte @System
+Panchroma PLA Metallic @System
+Panchroma PLA Neon @System
+Panchroma PLA Satin @System
+Panchroma PLA Silk @System
+Panchroma PLA Starlight @System
+Panchroma PLA Temp Shift @System
+Panchroma PLA Translucent @System
+Panchroma PLA UV Shift @System
+PlastAR PLA @System
+PolyLite ABS @System
+PolyLite ASA @System
+PolyLite Dual PLA @System
+PolyLite PETG @System
+PolyLite PLA @System
+PolyLite PLA Pro @System
+PolyTerra Dual PLA @System
+PolyTerra PLA @System
+Polymaker HT-PLA @System
+Polymaker HT-PLA-GF @System
+Polymaker PLA Pro @System
+PrintaLot ABS @System
+SUNLU Marble PLA @System
+SUNLU PETG @System
+SUNLU PLA Matte @System
+SUNLU PLA+ 2.0 @System
+SUNLU PLA+ @System
+SUNLU Silk PLA+ @System
+SUNLU Wood PLA @System
+School House Spools Marble PLA @System
+School House Spools Matte PETG @System
+School House Spools Matte PLA @System
+School House Spools PETG @System
+School House Spools PLA @System
+School House Spools Silk PLA @System
+School House Spools TPU 95A @System
+School House Spools Transparent PETG @System
+Valment PLA @System
+Valment PLA Galaxy @System
+Valment PLA Silk @System
+Valment PLA-CF @System
+eSUN PETG @System
+eSUN PLA+ @System
+eSUN PLA-Basic @System
+eSUN PLA-Marble @System
+eSUN PLA-Matte @System
+eSUN ePLA-LW @System
