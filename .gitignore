@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+*.whl
+dist/
+build/
+# Local notes: account e-mail, tokens, test spool UIDs. Never committed.
+LOCAL.md
