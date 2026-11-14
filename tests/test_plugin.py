@@ -296,3 +296,100 @@ class SlotTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InventoryTest(unittest.TestCase):
+    def test_rack_and_place(self):
+        spool = plugin.spool_from_document("aa01", document(rack={"id": "r1", "level": 1, "position": 3}), DB)
+        self.assertEqual(spool["rack"], {"id": "r1", "level": 1, "position": 3})
+        self.assertEqual(plugin.rack_label(spool["rack"], {"r1": "Regal"}), "Regal, B4")
+        self.assertEqual(plugin.rack_label({"id": "r9", "level": None, "position": 0}, {}), "r9, 1")
+        self.assertEqual(plugin.rack_label(None, {}), "")
+        self.assertIsNone(plugin.spool_from_document("aa01", document(rack=None), DB)["rack"])
+
+    def test_cache_holds_preset_and_place(self):
+        spools = plugin.spools_from_documents([("aa01", document(rack={"id": "r1", "level": 0, "position": 0}))], DB)
+        names = plugin.preset_names(spools)
+        cache = plugin.inventory_cache(spools, names, set(names.values()), {"r1": "Regal"}, 5)
+        self.assertEqual(cache["synced_at"], 5)
+        self.assertEqual(cache["spools"][0]["preset"], "Sunlu PLA+ Olive Green")
+        self.assertEqual(cache["spools"][0]["place"], "Regal, A1")
+        self.assertIsNone(plugin.inventory_cache(spools, names, set(), {}, 5)["spools"][0]["preset"])
+        json.dumps(cache)  # the tab gets it as JSON
+
+    def test_filament_used(self):
+        text = "\n".join(["G1 X1", "; filament used [mm] = 100.0, 0.0",
+                          "; filament used [g] = 12.34, 0.00, 250.5", ""])
+        self.assertEqual(plugin.parse_filament_used(text), [12.34, 0.0, 250.5])
+        self.assertIsNone(plugin.parse_filament_used("G1 X1"))
+
+    def test_slot_rows_warn_when_short(self):
+        spools = plugin.spools_from_documents(
+            [("aa01", document(twin_tag_uid="aa02")), ("bb01", document(name="Red", weight_available=900))], DB)
+        uid_of = {"_local/tigertag/A": "AA02", "_local/tigertag/B": "BB01"}.get
+        rows = plugin.slot_rows(["_local/tigertag/A", "_local/tigertag/B", "Generic PLA @System"], uid_of, spools,
+                                [300.0, 300.0, 5.0])
+        self.assertEqual([(r["slot"], r["preset"], r["short"]) for r in rows],
+                         [(1, "A", True), (2, "B", False), (3, "Generic PLA @System", False)])
+        self.assertEqual(rows[0]["spool"]["uid"], "AA01")
+        self.assertIsNone(rows[2]["spool"])
+        self.assertIsNone(plugin.slot_rows(["x"], uid_of, spools, None)[0]["needed_g"])
+
+    def test_latest_gcode_of_this_process_with_a_hidden_name(self):
+        with tempfile.TemporaryDirectory() as folder:
+            def gcode(session, name, mtime):
+                path = os.path.join(folder, "Sat_Nov_14", session, "Metadata", name)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as handle:
+                    print("; filament used [g] = 1.0", file=handle)
+                os.utime(path, (mtime, mtime))
+                return path
+            gcode("19_45_29#27076#63", ".27076.0.gcode", 100)
+            newest = gcode("20_29_43#27076#586", ".27076.1.gcode", 200)
+            gcode("21_00_00#999#1", ".999.0.gcode", 300)  # another Orca process
+            self.assertEqual(plugin.find_latest_gcode(folder, 27076), newest)
+            self.assertEqual(plugin.read_filament_used(newest), [1.0])
+            self.assertIsNone(plugin.find_latest_gcode(folder, 1))
+            self.assertIsNone(plugin.find_latest_gcode("", 27076))
+
+
+class LoadRequestTest(unittest.TestCase):
+    def test_firestore_value(self):
+        value = plugin.firestore_value({"a": 1, "b": [1.5, "x", None, True], "c": {}})
+        self.assertEqual(value, {"mapValue": {"fields": {
+            "a": {"integerValue": "1"},
+            "b": {"arrayValue": {"values": [{"doubleValue": 1.5}, {"stringValue": "x"},
+                                            {"nullValue": None}, {"booleanValue": True}]}},
+            "c": {"mapValue": {"fields": {}}}}}})
+        self.assertEqual(plugin.firestore_plain(plugin.firestore_value({"a": [1, None]})), {"a": [1, None]})
+
+    def test_gcode_presets(self):
+        text = '; filament_settings_id = "_local/tigertag/A B";"_local/tigertag/C";"Mine Selbst"\n'
+        self.assertEqual(plugin.parse_gcode_presets(text), ["_local/tigertag/A B", "_local/tigertag/C", "Mine Selbst"])
+        self.assertIsNone(plugin.parse_gcode_presets("G1\n"))
+
+    def test_slot_keys(self):
+        self.assertEqual(plugin.printer_slot_key(1, []), "1")
+        self.assertEqual(plugin.printer_slot_key(1, ["0", "2"]), "0")
+
+    def test_request_holds_used_tigertag_slots_only(self):
+        spools = plugin.spools_from_documents(
+            [("aa01", document(twin_tag_uid="aa02", rack={"id": "r1", "level": 0, "position": 2})),
+             ("bb01", document(name="Red"))], DB)
+        names = plugin.preset_names(spools)
+        cached = plugin.inventory_cache(spools, names, set(names.values()), {"r1": "Regal"}, 5)["spools"]
+        uid_of = {"_local/tigertag/A": "AA01", "_local/tigertag/B": "BB01"}.get
+        rows = plugin.slot_rows(["_local/tigertag/A", "_local/tigertag/B", "Generic PLA @System"],
+                                uid_of, cached, [12.34, 0.0, 3.0])
+        request = plugin.build_load_request(rows, True, [], 1000, "job")
+        self.assertEqual(sorted(request["slots"]), ["1"])  # B is unused, slot 3 has no TigerTag spool
+        slot = request["slots"]["1"]
+        self.assertEqual(slot["uids"], ["AA01", "AA02"])
+        self.assertEqual(slot["grams_needed"], 12.3)
+        self.assertEqual(slot["rack"], {"id": "r1", "name": "Regal", "level": 0, "position": 2})
+        self.assertEqual((slot["material"], slot["color"], slot["place"]), ("PLA", "#5A6D30", "Regal, A3"))
+        self.assertEqual((request["source"], request["requested_at"], request["job"]), ("orcaslicer", 1000, "job"))
+        unsliced = plugin.build_load_request(rows, False, [], 1000, "job")
+        self.assertEqual(sorted(unsliced["slots"]), ["1", "2"])
+        self.assertIsNone(unsliced["slots"]["2"]["rack"])
+        plugin.firestore_value(request)  # encodable

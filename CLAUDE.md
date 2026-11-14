@@ -60,7 +60,9 @@ nozzle range and density in the filament tab.
      active printer preset (`preset_bundle().current_printer_preset()`) to an
      account printer via config `printers` {Orca preset name: printer id};
      without an entry it takes the one printer with slot data whose brand or
-     `printerName` matches `printer_model`, and saves that choice.
+     `printerName` matches `printer_model`, and saves that choice in
+     `<data_dir>/tigertag_plugin/printers.json` (shared by all actions; the
+     config of each action can override it).
    - A user's saved copy of a TigerTag preset (the only user preset whose
      `filament_notes` carries that chip UID) is loaded instead of the bundle
      preset; a bundle preset is passed by its internal name `_local/tigertag/<name>`.
@@ -77,6 +79,68 @@ nozzle range and density in the filament tab.
      version may lose the saved e-mail. Not tested.
 2. **An inventory tab in Orca.** The spools with what is left on them; a warning
    when the sliced job needs more filament than the chosen spool holds.
+   Written 2026-11-14 (Pages capability `TigerTagInventory`), unit-tested, not
+   yet run in Orca. What shaped it:
+   - A page's `on_message` and `on_lifecycle_event` run on the UI thread
+     (`PluginPages.cpp`, `PluginManager.cpp`); `post_message` is thread-safe.
+     The tab therefore makes no request: every sync writes
+     `<data_dir>/tigertag_plugin/inventory.json`, the tab reads it.
+   - Config is per capability: the tab cannot read the Script's e-mail or
+     `printers`, so it has no sync button yet. Everything shared (session,
+     printer mapping, inventory) therefore lives in `<data_dir>/tigertag_plugin/`.
+   - Tested 2026-11-14: tab shows slots, places and the need of a slice
+     (252 g on a 58 g spool -> red warning). The need is shown only while the
+     G-code's `filament_settings_id` equals the current slot presets.
+   - No API gives the filament used by a slice; `SlicingJobComplete` carries
+     only the model name. The tab reads `; filament used [g] = 0.76, 0.96,
+     ...` (one value per filament slot, near the end) from Orca's temp G-code,
+     checked 2026-11-14 on a real slice:
+     `%TEMP%/orcaslicer_model/<day>/<time>#<pid>#<n>/Metadata/.<pid>.<plate>.gcode`
+     - a hidden name, so `glob(..., include_hidden=True)`.
+   - Orca crashed three times on 2026-11-14 (19:45, 20:46, 21:08; dumps in
+     `%LOCALAPPDATA%/CrashDumps`, unsymbolized stacks in `log/crash_*.log`).
+     Cause not proven; the 20:46 stack contains `PyInit_orca`, the 21:08 crash
+     came 5 s after the send action while the printer connected. Since then
+     the tab touches no preset data inside a lifecycle event (they fire in the
+     middle of preset switches and AMS syncs): `SlicingJobComplete` only posts
+     "changed", the page asks back, and it polls every 5 s while visible.
+     `PresetSelected` is not handled.
+   - A page's `on_message` receives the message already parsed (a dict), not
+     JSON text, although the C++ side dumps it to a string.
+   - `[AUDIT] block path=...` lines are a pre-check, not a denial: with the
+     tree grant the reads succeed and no `AUDIT PROMPT` follows.
+   - Every file access outside `data_dir()` raises an audit prompt (the first
+     version raised 47: one per scanned folder, and `tempfile.gettempdir()`
+     alone raised three by probing Temp with a file). The plugin now asks
+     once at load for `fs_read=[<TEMP>/orcaslicer_model/*]` - a "/*" target
+     grants a whole tree - and takes the folder from `TEMP`.
+   - Places: inventory field `rack` {id, level, position}, 49 of the owner's
+     62 spools have one; rack names in `users/{uid}/racks/{id}.name` ("Regal",
+     "Schrank Links", ...). Shown as Studio does: "Karton Sunlu 250G, B5".
+2b. **Load request, Orca -> TigerSpool.** Action "TigerTag: send slots to
+   TigerSpool" writes `users/{uid}/load_requests/{printerId}`; TigerSpool shows
+   at the printer which spool goes into which slot and where it is stored.
+   Written 2026-11-14, unit-tested, not run in Orca. Format agreed with the
+   TigerSpool session (2026-11-14):
+   `{source: "orcaslicer", requested_at: ms, job, slots: {<printer slot key>:
+   {uid, uids: [both chips], preset, material, color, grams_needed,
+   rack: {id, name, level, position} | null, place}}}`. Only slots holding a
+   TigerTag spool; after a slice only the slots the plate uses. The whole
+   document is replaced; the device never writes it, a request counts as done
+   when `slots` matches it, and is ignored after 24 h. `place` is English
+   display text for other readers - TigerSpool ignores it and builds its own
+   from `rack` (i18n, font coverage).
+   - TigerSpool reads it with one `documents:batchGet` over `printer_ids`,
+     every second heartbeat (only one TLS session fits in its RAM).
+   - Confirmed 2026-11-14 in Orca: the send action gets HTTP 403.
+   - Firestore has no wildcard rule under `users/{uid}`: until TigerTag adds
+     `match /users/{uid}/load_requests/{printerId}` (read, write if
+     auth.uid == uid), the write fails with 403 and the plugin says so. The
+     owner cannot deploy rules to `tigertag-connect` himself.
+   - `rack.level` and `rack.position` count from 0; Tiger Studio shows the
+     level as a letter and the position from 1 (stored level 1, position 4 =
+     "B5", confirmed by the owner on 2026-11-14). The plugin shows it the same
+     way; the TigerSpool firmware never reads `rack`.
 3. **Later, deliberately not first: subtract what a print used** from the
    spool's `weight_available`. That field belongs to the TigerScale, and a
    second writer on it is an open question with TigerTag (the same question is

@@ -13,10 +13,13 @@ written but not yet tested.**
 2. **The right preset in each filament slot** (written, untested): when a
    TigerSpool loaded a spool into your printer, the sync puts that spool's
    preset into the matching filament slot of the selected printer.
-3. A TigerTag tab listing your spools and what is left on them, with a warning
-   when a job needs more than the spool holds (planned).
+3. **A TigerTag tab** (written, untested): your spools with what is left on
+   them and where they are stored, the spool in each filament slot, and a
+   warning when the sliced plate needs more than that spool holds. It shows
+   what the last sync read; run the sync to update it.
 
-The plugin only reads your account. It never changes it.
+The plugin reads your account. The only thing it writes is a load request for
+your TigerSpool, and only when you send one; spools and weights stay untouched.
 
 ## Install
 
@@ -35,9 +38,16 @@ When a TigerSpool reports a spool in a slot, your copy is loaded instead of
 the TigerTag preset.
 
 The sync works out which printer in your TigerTag account the selected
-OrcaSlicer printer is, and remembers it under `printers` in the Config tab.
+OrcaSlicer printer is, and remembers it in `tigertag_plugin/printers.json`.
 If it cannot tell, it says so; then add `"<OrcaSlicer printer preset name>":
 "<printer id>"` there yourself.
+
+*TigerTag: send slots to TigerSpool* (written, untested) does the opposite:
+it tells your TigerSpool which spool goes into which slot of the selected
+printer, and where each spool is stored. After a slice it asks only for the
+slots the plate uses. It writes one document per printer to your account
+(`load_requests`), and nothing else. The TigerTag account must allow this;
+until it does, the action reports that it was refused.
 
 ## Development
 

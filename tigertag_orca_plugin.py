@@ -25,11 +25,13 @@ it put into which printer slot. The Orca printer preset is tied to an account
 printer once (config "printers", filled automatically when only one printer with
 slot data looks like the printer model).
 
-The account is only read. Nothing is written back to TigerTag.
+"TigerTag: send slots to TigerSpool" writes users/{uid}/load_requests/{printerId}, the
+only write: which spool goes into which slot. Spools and weights are never written.
 
 The module also imports without Orca (orca = None), so the pure functions can be
 tested and tools/dry_run.py can run a sync outside the slicer.
 """
+import glob
 import json
 import os
 import re
@@ -61,6 +63,8 @@ NETWORK_HOSTS = [
 BUNDLE_ID = "tigertag"
 STATE_FOLDER = "tigertag_plugin"  # below data_dir(); survives a reinstall of the plugin
 SESSION_FILE = ".session.json"
+PRINTER_MAP_FILE = "printers.json"  # Orca printer preset -> account printer id, shared by all actions
+INVENTORY_CACHE_FILE = "inventory.json"  # written by the sync, read by the TigerTag tab
 # A slot map in this file (plugin folder) replaces what the TigerSpools published:
 # for testing slot loading without a printer or a TigerSpool.
 TEST_SLOTS_FILE = "test_slots.json"
@@ -74,7 +78,7 @@ INVENTORY_MASK = [
     "deleted", "twin_tag_uid", "id_type", "id_material", "id_brand", "id_aspect1",
     "series", "name", "online_color", "color_r", "color_g", "color_b",
     "data1", "data2", "data3", "data6", "data7",
-    "measure_gr", "weight_available",
+    "measure_gr", "weight_available", "rack",
     "catalogProduct.brand", "catalogProduct.material", "catalogProduct.series",
     "catalogProduct.filament.diameter",
 ]
@@ -114,10 +118,10 @@ _FIREBASE_MESSAGES = {
 }
 
 
-def http_json(what, url, body=None, token=None, timeout=30):
-    """POST body (or GET without one) and return the parsed JSON answer."""
+def http_json(what, url, body=None, token=None, timeout=30, method=None):
+    """POST body (or GET without one; or `method`) and return the parsed JSON answer."""
     data = json.dumps(body).encode("utf-8") if body is not None else None
-    request = urllib.request.Request(url, data=data, method="POST" if data is not None else "GET")
+    request = urllib.request.Request(url, data=data, method=method or ("POST" if data is not None else "GET"))
     request.add_header("Content-Type", "application/json")
     if token:
         request.add_header("Authorization", "Bearer " + token)
@@ -133,6 +137,8 @@ def http_json(what, url, body=None, token=None, timeout=30):
         code = message.split(":")[0].strip()
         if code in _FIREBASE_MESSAGES:
             raise TigerTagError(_FIREBASE_MESSAGES[code]) from None
+        if error.code == 403:
+            raise TigerTagError(f"{what} failed: the TigerTag account does not allow this (HTTP 403).") from None
         raise TigerTagError(f"{what} failed: HTTP {error.code} {message}".strip()) from None
     except (urllib.error.URLError, TimeoutError, OSError) as error:
         reason = getattr(error, "reason", error)
@@ -167,6 +173,30 @@ def firestore_plain(value):
     if kind == "nullValue":
         return None
     return inner
+
+
+def firestore_value(value):
+    """Plain Python -> a Firestore REST typed value."""
+    if value is None:
+        return {"nullValue": None}
+    if isinstance(value, bool):
+        return {"booleanValue": value}
+    if isinstance(value, int):
+        return {"integerValue": str(value)}
+    if isinstance(value, float):
+        return {"doubleValue": value}
+    if isinstance(value, dict):
+        return {"mapValue": {"fields": {str(key): firestore_value(item) for key, item in value.items()}}}
+    if isinstance(value, (list, tuple)):
+        return {"arrayValue": {"values": [firestore_value(item) for item in value]}}
+    return {"stringValue": str(value)}
+
+
+def write_document(what, path, fields, id_token):
+    """Create or replace the document at path with exactly these fields."""
+    url = f"{FIRESTORE_URL}/{urllib.parse.quote(path)}"
+    body = {"fields": {key: firestore_value(value) for key, value in fields.items()}}
+    return http_json(what, url, body, token=id_token, method="PATCH")
 
 
 def fetch_documents(what, path, mask, id_token):
@@ -244,6 +274,13 @@ def _colour_hex(fields):
     return None
 
 
+def _rack(value):
+    """The spool's place, {"id", "level", "position"}, or None."""
+    if not (isinstance(value, dict) and value.get("id")):
+        return None
+    return {"id": str(value["id"]), "level": value.get("level"), "position": value.get("position")}
+
+
 def spool_from_document(doc_id, fields, db):
     """One inventory document -> a spool dict, or None when it is not a usable filament."""
     if fields.get("deleted"):
@@ -286,6 +323,7 @@ def spool_from_document(doc_id, fields, db):
         "bed": bed if all(bed) and bed[0] <= bed[1] else None,
         "measure_g": _positive(fields.get("measure_gr")),
         "remaining_g": fields.get("weight_available") if isinstance(fields.get("weight_available"), int) else None,
+        "rack": _rack(fields.get("rack")),
     }
 
 
@@ -650,6 +688,130 @@ def fetch_printer_names(uid, id_token):
     return printers
 
 
+# --------------------------------------------------------------------------- inventory tab
+
+def fetch_rack_names(uid, id_token):
+    """Rack id -> its name, from users/{uid}/racks."""
+    documents = fetch_documents("Reading the racks", f"users/{uid}/racks", ["name"], id_token)
+    return {rack_id: fields.get("name") or rack_id for rack_id, fields in documents}
+
+
+def rack_label(rack, rack_names):
+    """ "Karton Sunlu 250G, B5" for a spool's rack entry, or "".
+
+    Level and position are stored from 0; Tiger Studio shows the level as a letter
+    and the position from 1 (level 1, position 4 is B5 - checked by the owner).
+    """
+    if not rack:
+        return ""
+    level, position = rack.get("level"), rack.get("position")
+    spot = ""
+    if isinstance(level, int) and 0 <= level < 26:
+        spot += chr(ord("A") + level)
+    if isinstance(position, int) and position >= 0:
+        spot += str(position + 1)
+    name = rack_names.get(rack["id"], rack["id"])
+    return f"{name}, {spot}" if spot else name
+
+
+def inventory_cache(spools, names, built, rack_names, now):
+    """What the TigerTag tab shows, written by every sync: the tab itself makes no request."""
+    return {
+        "synced_at": now,
+        "spools": [dict(spool, preset=names.get(spool["uid"]) if names.get(spool["uid"]) in built else None,
+                        place=rack_label(spool["rack"], rack_names),
+                        rack=dict(spool["rack"], name=rack_names.get(spool["rack"]["id"], ""))
+                        if spool["rack"] else None)
+                   for spool in spools],
+    }
+
+
+_USED_G = re.compile(r"^;\s*filament used \[g\]\s*=\s*(.+)$", re.MULTILINE)
+
+
+def parse_filament_used(text):
+    """The grams per filament of an Orca G-code ("; filament used [g] = 1.23, 0.00"), or None."""
+    match = _USED_G.search(text)
+    if not match:
+        return None
+    grams = []
+    for item in match.group(1).split(","):
+        try:
+            grams.append(float(item))
+        except ValueError:
+            return None
+    return grams
+
+
+_SETTINGS_ID = re.compile(r"^;\s*filament_settings_id\s*=\s*(.*)$", re.MULTILINE)
+
+
+def parse_gcode_presets(text):
+    """The filament preset per slot an Orca G-code was sliced with, or None."""
+    match = _SETTINGS_ID.search(text)
+    if not match:
+        return None
+    return [item.strip().strip('"') for item in match.group(1).split(";")]
+
+
+def printer_slot_key(orca_slot, known_keys):
+    """Orca's 1-based slot -> the printer's own slot key (inverse of orca_slot_number)."""
+    zero_based = any(str(key).strip() == "0" for key in known_keys)
+    return str(orca_slot - 1 if zero_based else orca_slot)
+
+
+def build_load_request(rows, sliced, known_keys, now_ms, job):
+    """The document for users/{uid}/load_requests/{printerId}: which spool goes into which slot.
+
+    Format agreed with TigerSpool (2026-11-14). Only slots holding a TigerTag spool
+    are asked for; after a slice, only the slots the plate uses.
+    """
+    slots = {}
+    for row in rows:
+        spool = row["spool"]
+        if spool is None or (sliced and not row["needed_g"]):
+            continue
+        rack = spool.get("rack")
+        slots[printer_slot_key(row["slot"], known_keys)] = {
+            "uid": spool["uid"],
+            "uids": [uid for uid in (spool["uid"], spool.get("twin_uid")) if uid],
+            "preset": row["preset"],
+            "material": spool.get("material") or "",
+            "color": spool.get("colour") or "",
+            "grams_needed": round(row["needed_g"], 1) if row["needed_g"] is not None else None,
+            "rack": {"id": rack["id"], "name": rack.get("name") or "", "level": rack.get("level"),
+                     "position": rack.get("position")} if rack else None,
+            "place": spool.get("place") or "",
+        }
+    return {"source": "orcaslicer", "requested_at": now_ms, "job": job, "slots": slots}
+
+
+def slot_rows(slot_presets, uid_of_preset, spools, used):
+    """One row per filament slot: preset, spool, grams needed, and whether the spool runs short.
+
+    slot_presets: the internal preset name per slot; uid_of_preset(name) -> chip uid or None;
+    used: grams per slot of the last slice, or None.
+    """
+    by_uid = {}
+    for spool in spools:
+        for uid in (spool["uid"], spool.get("twin_uid")):
+            if uid:
+                by_uid[uid] = spool
+    rows = []
+    for index, preset in enumerate(slot_presets):
+        spool = by_uid.get(uid_of_preset(preset) or "")
+        needed = used[index] if used is not None and index < len(used) else None
+        remaining = spool.get("remaining_g") if spool else None
+        rows.append({
+            "slot": index + 1,
+            "preset": display_name(preset),
+            "spool": spool,
+            "needed_g": needed,
+            "short": bool(needed and remaining is not None and needed > remaining),
+        })
+    return rows
+
+
 # --------------------------------------------------------------------------- bundle on disk
 
 def write_text(path, text):
@@ -795,6 +957,13 @@ def sync(capability):
                             "but OrcaSlicer does not list the bundle there.")
     orca.host.preset.bundles.reload_local(BUNDLE_ID)
 
+    try:
+        rack_names = fetch_rack_names(session["uid"], session["id_token"])
+    except TigerTagError:
+        rack_names = {}  # the tab then shows rack ids instead of names
+    write_text(os.path.join(state_dir(), INVENTORY_CACHE_FILE),
+               json.dumps(inventory_cache(spools, preset_names(spools), set(presets), rack_names, int(time.time()))))
+
     message = f"TigerTag: {len(presets)} filament preset(s) from {len(spools)} spool(s)."
     if skipped:
         message += " Skipped: " + "; ".join(skipped) + "."
@@ -805,6 +974,21 @@ def sync(capability):
     if slots:
         message += " " + slots
     return message
+
+
+def load_printer_map():
+    try:
+        with open(os.path.join(state_dir(), PRINTER_MAP_FILE), encoding="utf-8") as handle:
+            stored = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return {str(key): str(value or "") for key, value in stored.items()} if isinstance(stored, dict) else {}
+
+
+def remember_printer(orca_printer, printer_id):
+    stored = load_printer_map()
+    stored[orca_printer] = printer_id
+    write_text(os.path.join(state_dir(), PRINTER_MAP_FILE), json.dumps(stored, indent=2, ensure_ascii=False))
 
 
 def printer_mapping(config):
@@ -831,7 +1015,7 @@ def assign_slots(capability, config, session, spools, built):
     bundle = orca.host.preset_bundle()
     printer = bundle.current_printer_preset()
     printer_model = printer.config_value("printer_model") or ""
-    mapping = printer_mapping(config)
+    mapping = dict(load_printer_map(), **printer_mapping(config))
 
     names = {}
 
@@ -850,7 +1034,7 @@ def assign_slots(capability, config, session, spools, built):
                 f"In the Config tab, add it to \"printers\" as \"{printer.name}\": \"<printer id>\" "
                 f"({known}).")
     if how == "matched":
-        capability.save_config(json.dumps(dict(config, printers=dict(mapping, **{printer.name: printer_id}))))
+        remember_printer(printer.name, printer_id)
 
     filaments = bundle.filaments
     entries = []
@@ -877,6 +1061,246 @@ def assign_slots(capability, config, session, spools, built):
     if notes:
         message += "; " + "; ".join(notes)
     return message + "."
+
+
+INVENTORY_PAGE = r"""<!doctype html>
+<meta charset="utf-8">
+<style>
+  :root { --fg: var(--orca-fg, #222); --muted: var(--orca-muted, #777); --line: var(--orca-border, #ddd);
+          --warn: #c62828; --ok: #2e7d32; }
+  body { margin: 0; padding: 14px 18px; font: 13px system-ui, sans-serif; color: var(--fg); }
+  header { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+  header h2 { margin: 0; font-size: 16px; }
+  header .muted { flex: 1; }
+  .muted { color: var(--muted); font-size: 12px; }
+  h3 { margin: 18px 0 8px; font-size: 14px; }
+  .slots { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 8px; }
+  .card { border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
+  .card.short { border-color: var(--warn); }
+  .card .top { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+  .warn { color: var(--warn); font-weight: 600; }
+  .sw { width: 14px; height: 14px; border-radius: 3px; border: 1px solid var(--line); flex: none; display: inline-block; vertical-align: middle; }
+  input { width: 260px; padding: 4px 6px; margin-bottom: 8px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--line); }
+  th { font-weight: 600; font-size: 12px; color: var(--muted); }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .bar { width: 80px; height: 6px; background: var(--line); border-radius: 3px; display: inline-block; vertical-align: middle; margin-left: 6px; }
+  .bar i { display: block; height: 100%; border-radius: 3px; background: var(--ok); }
+</style>
+<header>
+  <h2>TigerTag</h2>
+  <span class="muted" id="synced"></span>
+  <button type="button" id="refresh">Refresh</button>
+</header>
+<div id="error" class="warn"></div>
+<h3>Filament slots</h3>
+<div class="muted" id="slicehint"></div>
+<div class="slots" id="slots"></div>
+<h3>Spools</h3>
+<input id="filter" placeholder="Filter: brand, material, colour, place">
+<table>
+  <thead><tr><th></th><th>Spool</th><th>Left</th><th>Place</th></tr></thead>
+  <tbody id="spools"></tbody>
+</table>
+<script>
+  let state = null;
+  const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const name = sp => sp.preset || [sp.brand, sp.series || sp.material, sp.colour_name].filter(Boolean).join(' ');
+  const grams = g => g == null ? '?' : Math.round(g) + ' g';
+  const swatch = c => '<span class="sw" style="background:' + esc(c || 'transparent') + '"></span>';
+
+  function slotCard(row) {
+    const sp = row.spool;
+    let body;
+    if (!sp) {
+      body = '<div class="muted">No TigerTag spool</div>';
+    } else {
+      body = '<div>' + grams(sp.remaining_g) + ' left' + (sp.place ? ' &middot; ' + esc(sp.place) : '') + '</div>';
+    }
+    if (row.needed_g != null && row.needed_g > 0) {
+      body += row.short
+        ? '<div class="warn">Needs ' + grams(row.needed_g) + ' - not enough on this spool</div>'
+        : '<div>Needs ' + grams(row.needed_g) + '</div>';
+    }
+    return '<div class="card' + (row.short ? ' short' : '') + '"><div class="top">' + row.slot + ' ' +
+      (sp ? swatch(sp.colour) : '') + ' ' + esc(row.preset) + '</div>' + body + '</div>';
+  }
+
+  function render() {
+    if (!state) return;
+    document.getElementById('synced').textContent = state.synced_at
+      ? 'Synced ' + new Date(state.synced_at * 1000).toLocaleString()
+      : 'Not synced yet: run "TigerTag: sync filament presets" in the Plugins window.';
+    document.getElementById('slicehint').textContent = state.sliced
+      ? '' : 'Slice the plate to see how much each slot needs.';
+    document.getElementById('slots').innerHTML = state.slots.map(slotCard).join('');
+    const words = document.getElementById('filter').value.toLowerCase().split(/\s+/).filter(Boolean);
+    const rows = state.spools.filter(sp => {
+      const text = [name(sp), sp.brand, sp.material, sp.colour_name, sp.place, sp.uid].join(' ').toLowerCase();
+      return words.every(w => text.includes(w));
+    }).map(sp => {
+      const share = sp.measure_g && sp.remaining_g != null ? Math.max(0, Math.min(1, sp.remaining_g / sp.measure_g)) : null;
+      return '<tr><td>' + swatch(sp.colour) + '</td><td>' + esc(name(sp)) + '</td><td class="num">' +
+        grams(sp.remaining_g) + (sp.measure_g ? ' / ' + grams(sp.measure_g) : '') +
+        (share == null ? '' : '<span class="bar"><i style="width:' + Math.round(share * 100) + '%"></i></span>') +
+        '</td><td>' + esc(sp.place) + '</td></tr>';
+    });
+    document.getElementById('spools').innerHTML = rows.join('') ||
+      '<tr><td colspan="4" class="muted">No spools.</td></tr>';
+  }
+
+  window.orca.onMessage(msg => {
+    if (!msg) return;
+    if (msg.command === 'state') { state = msg.state; document.getElementById('error').textContent = ''; render(); }
+    if (msg.command === 'error') document.getElementById('error').textContent = msg.text;
+    if (msg.command === 'changed') refresh();
+  });
+  // Slots change in the sidebar without telling the page; ask again every few
+  // seconds while the tab is visible (the plugin reads presets only when asked).
+  function refresh() { window.orca.postMessage({command: 'refresh'}); }
+  setInterval(() => { if (document.visibilityState === 'visible') refresh(); }, 5000);
+  document.getElementById('refresh').onclick = refresh;
+  document.getElementById('filter').oninput = render;
+  window.orca.postMessage({command: 'ready'});
+</script>
+"""
+
+
+def slice_folder():
+    """<temp>/orcaslicer_model, where OrcaSlicer writes the G-code of a slice.
+
+    Read from TEMP, not tempfile.gettempdir(): that one probes the folder by
+    creating and deleting a file, and every probe raises a permission prompt.
+    """
+    temp = os.environ.get("TEMP") or os.environ.get("TMP") or ""
+    return os.path.join(temp, "orcaslicer_model") if temp else ""
+
+
+_SESSION_DIRS = {}  # (slice folder, pid) -> the Metadata folder of that Orca session
+
+
+def find_latest_gcode(folder, pid):
+    """The G-code OrcaSlicer wrote for the last slice in this session, or None.
+
+    Orca slices into <folder>/<day>/<time>#<pid>#<n>/Metadata/.<pid>.<plate>.gcode
+    (a hidden name). The plugin runs inside Orca, so the pid is its own.
+    """
+    if not folder:
+        return None
+    key = (folder, pid)
+    files = []
+    if key in _SESSION_DIRS:  # the folder of this Orca session, found before: no new scan
+        files = glob.glob(os.path.join(glob.escape(_SESSION_DIRS[key]), "*.gcode"), include_hidden=True)
+    if not files:
+        pattern = os.path.join(glob.escape(folder), "*", f"*#{pid}#*", "Metadata", "*.gcode")
+        files = glob.glob(pattern, include_hidden=True)
+    if not files:
+        return None
+    newest = max(files, key=os.path.getmtime)
+    _SESSION_DIRS[key] = os.path.dirname(newest)
+    return newest
+
+
+def _gcode_tail(path):
+    """The end of a G-code file, where Orca writes the totals and the config."""
+    with open(path, "rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        handle.seek(max(0, handle.tell() - 512 * 1024))
+        return handle.read().decode("utf-8", "replace")
+
+
+def read_filament_used(path):
+    """Grams per filament of a G-code file, or None."""
+    try:
+        return parse_filament_used(_gcode_tail(path))
+    except OSError:
+        return None
+
+
+def last_slice(slot_presets):
+    """Grams per slot of the newest slice, or None when there is none or the slots changed since."""
+    path = find_latest_gcode(slice_folder(), os.getpid())
+    if not path:
+        return None
+    try:
+        tail = _gcode_tail(path)
+    except OSError:
+        return None
+    presets = parse_gcode_presets(tail)
+    if presets is not None and presets != list(slot_presets):
+        return None  # sliced with other filaments than the slots hold now
+    return parse_filament_used(tail)
+
+
+def inventory_state(used):
+    """Everything the TigerTag tab shows, from the sync's cache and the current slots."""
+    try:
+        with open(os.path.join(state_dir(), INVENTORY_CACHE_FILE), encoding="utf-8") as handle:
+            cache = json.load(handle)
+    except (OSError, ValueError):
+        cache = {"synced_at": None, "spools": []}
+    spools = cache.get("spools", [])
+    preset_uid = {LOCAL_PREFIX + spool["preset"]: spool["uid"] for spool in spools if spool.get("preset")}
+
+    bundle = orca.host.preset_bundle()
+    filaments = bundle.filaments
+
+    def uid_of_preset(name):
+        if name in preset_uid:
+            return preset_uid[name]
+        preset = filaments.find_preset(name)
+        match = NOTE_UID.search((preset.config_value("filament_notes") or "") if preset is not None else "")
+        return match.group(1).upper() if match else None
+
+    slots = list(bundle.current_filament_preset_names())
+    return {
+        "synced_at": cache.get("synced_at"),
+        "spools": spools,
+        "slots": slot_rows(slots, uid_of_preset, spools, used),
+        "sliced": used is not None,
+    }
+
+
+def send_load_request(capability):
+    """Write the active printer's slots as a load request for TigerSpool. Returns the message."""
+    stored = load_session(os.path.join(state_dir(), SESSION_FILE))
+    if not stored.get("refresh_token"):
+        raise TigerTagError("Run \"TigerTag: sync filament presets\" once first; it signs in.")
+    session = refresh_session(stored["refresh_token"])
+    write_text(os.path.join(state_dir(), SESSION_FILE),
+               json.dumps(dict(stored, refresh_token=session["refresh_token"])))
+
+    config = json.loads(capability.get_config() or "{}")
+    bundle = orca.host.preset_bundle()
+    printer = bundle.current_printer_preset()
+    mapping = dict(load_printer_map(), **printer_mapping(config))
+    names = fetch_printer_names(session["uid"], session["id_token"])
+    printer_id, how = choose_printer(printer.name, printer.config_value("printer_model") or "", mapping,
+                                     sorted(names), lambda pid: names.get(pid, (None, None)))
+    if printer_id is None:
+        known = ", ".join(f"{name} = {pid}" for pid, (_brand, name) in sorted(names.items()))
+        raise TigerTagError(f"Which TigerTag printer is '{printer.name}'? In this action's Config tab, add "
+                            f"\"printers\": {{\"{printer.name}\": \"<printer id>\"}} ({known}).")
+    if how == "matched":
+        remember_printer(printer.name, printer_id)
+
+    slot_presets = list(bundle.current_filament_preset_names())
+    state = inventory_state(last_slice(slot_presets))
+    if not state["spools"]:
+        raise TigerTagError("Run \"TigerTag: sync filament presets\" first; there is no inventory yet.")
+    known_keys = list(fetch_slot_maps(session["uid"], session["id_token"]).get(printer_id, {}))
+    request = build_load_request(state["slots"], state["sliced"], known_keys, int(time.time() * 1000),
+                                 time.strftime("%Y-%m-%d %H:%M"))
+    if not request["slots"]:
+        raise TigerTagError("No filament slot holds a TigerTag spool"
+                            + (" that this plate uses." if state["sliced"] else "."))
+    write_document("Sending the load request", f"users/{session['uid']}/load_requests/{printer_id}",
+                   request, session["id_token"])
+    label = names.get(printer_id, (None, printer_id))[1]
+    parts = [f"{key} {slot['preset']}" + (f" ({slot['grams_needed']} g)" if slot["grams_needed"] else "")
+             for key, slot in sorted(request["slots"].items(), key=lambda item: (len(item[0]), item[0]))]
+    return f"TigerTag: sent to {label}: " + ", ".join(parts) + "."
 
 
 def notify(text, error=False):
@@ -913,8 +1337,62 @@ if orca is not None:
             notify(message, error=True)
             return orca.ExecutionResult.failure(orca.PluginResult.RecoverableError, message)
 
+    class TigerTagSend(orca.script.ScriptPluginCapabilityBase):
+        def get_name(self):
+            return "TigerTag: send slots to TigerSpool"
+
+        def get_default_config(self):
+            return {"printers": {}}
+
+        def execute(self):
+            try:
+                message = send_load_request(self)
+            except (TigerTagError, RuntimeError) as error:
+                message = f"TigerTag: {error}"
+                notify(message, error=True)
+                return orca.ExecutionResult.failure(orca.PluginResult.RecoverableError, message)
+            notify(message)
+            return orca.ExecutionResult.success(message)
+
+    class TigerTagInventory(orca.pages.PagesPluginCapabilityBase):
+        """The TigerTag tab: spools, places, what is left, and the slots of the last slice."""
+
+        def get_name(self):
+            return "TigerTag"
+
+        def get_ui(self):
+            return INVENTORY_PAGE
+
+        def post_state(self):
+            try:
+                slots = list(orca.host.preset_bundle().current_filament_preset_names())
+                self.post_message({"command": "state", "state": inventory_state(last_slice(slots))})
+            except (TigerTagError, RuntimeError, OSError) as error:
+                self.post_message({"command": "error", "text": str(error)})
+
+        def on_message(self, message):
+            # Orca hands the page's message over already parsed (a dict), not as JSON text.
+            if isinstance(message, str):
+                try:
+                    message = json.loads(message)
+                except ValueError:
+                    return
+            if isinstance(message, dict) and message.get("command") in ("ready", "refresh"):
+                self.post_state()
+
+        def on_lifecycle_event(self, event, ctx):
+            # Touch nothing here: events fire in the middle of preset switches and AMS syncs.
+            # The page is only told to ask again; its request arrives later, when Orca is idle.
+            if event == orca.LifecycleEvent.SlicingJobComplete:
+                self.post_message({"command": "changed"})
+
     @orca.plugin
     class TigerTagPlugin(orca.base):
         def register_capabilities(self):
-            orca.request_permissions(network=NETWORK_HOSTS)
+            # One grant for the whole slice folder, asked once at load: the tab reads
+            # the G-code of each slice there. Without it every folder read prompts.
+            folder = slice_folder()
+            orca.request_permissions(network=NETWORK_HOSTS, fs_read=[os.path.join(folder, "*")] if folder else [])
             orca.register_capability(TigerTagSync)
+            orca.register_capability(TigerTagSend)
+            orca.register_capability(TigerTagInventory)
