@@ -407,3 +407,9 @@ class LoadRequestTest(unittest.TestCase):
         self.assertEqual(sorted(unsliced["slots"]), ["1", "2"])
         self.assertIsNone(unsliced["slots"]["2"]["rack"])
         plugin.firestore_value(request)  # encodable
+
+        preview = plugin.load_request_preview(rows, False, "p1", ["0", "1", "2"])  # Happy Hare: gates from 0
+        self.assertEqual(preview["printer_id"], "p1")
+        self.assertEqual([slot["key"] for slot in preview["slots"]], ["0", "1"])
+        self.assertEqual(preview["slots"][0]["place"], slot["place"])
+        self.assertEqual(plugin.load_request_preview(rows, True, None, [])["slots"][0]["key"], "1")

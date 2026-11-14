@@ -69,6 +69,7 @@ INVENTORY_CACHE_FILE = "inventory.json"  # written by the sync, read by the Tige
 # A slot map in this file (plugin folder) replaces what the TigerSpools published:
 # for testing slot loading without a printer or a TigerSpool.
 TEST_SLOTS_FILE = "test_slots.json"
+SLOT_KEYS_FILE = "slot_keys.json"  # printer id -> its slot keys, from the last sync (0- or 1-based)
 DB_CACHE_FILE = "tigertag_db_cache.json"
 DB_TABLES = ("id_brand", "id_material", "id_diameter", "id_aspect")
 FILAMENT_TYPE_ID = 142
@@ -794,6 +795,16 @@ def build_load_request(rows, sliced, known_keys, now_ms, job):
     return {"source": "orcaslicer", "requested_at": now_ms, "job": job, "slots": slots}
 
 
+def load_request_preview(rows, sliced, printer_id, slot_keys):
+    """What the tab shows of the load request it would send: its slots in the printer's order."""
+    request = build_load_request(rows, sliced, slot_keys, 0, "")
+    return {
+        "printer_id": printer_id,
+        "slots": [dict(slot, key=key) for key, slot in
+                  sorted(request["slots"].items(), key=lambda item: (len(item[0]), item[0]))],
+    }
+
+
 def slot_rows(slot_presets, uid_of_preset, spools, used):
     """One row per filament slot: preset, spool, grams needed, and whether the spool runs short.
 
@@ -1030,6 +1041,11 @@ def assign_slots(capability, config, session, spools, built, known_printers=None
     if slot_maps is None:
         slot_maps = fetch_slot_maps(session["uid"], session["id_token"])
     candidates = sorted(printer_id for printer_id, slots in slot_maps.items() if any(slots.values()))
+    try:
+        write_text(os.path.join(state_dir(), SLOT_KEYS_FILE),
+                   json.dumps({printer_id: sorted(slots) for printer_id, slots in slot_maps.items()}))
+    except OSError:
+        pass  # only the tab's preview of a Happy Hare request numbers its gates wrong
     if not candidates:
         return f"Slots{source}: no slot holds a spool." if source else ""
 
@@ -1113,7 +1129,6 @@ INVENTORY_PAGE = r"""<!doctype html>
 <header>
   <h2>TigerTag</h2>
   <span class="muted" id="synced"></span>
-  <button type="button" id="sync">Sync with TigerTag</button>
   <button type="button" id="refresh">Refresh</button>
 </header>
 <div id="status" class="muted"></div>
@@ -1123,10 +1138,17 @@ INVENTORY_PAGE = r"""<!doctype html>
   <span id="orcaprinter"></span>
   <span>is the TigerTag printer</span>
   <select id="printer"></select>
+  <button type="button" id="sync">Sync with TigerTag</button>
   <span class="muted" id="printerhint"></span>
 </div>
 <div class="muted" id="slicehint"></div>
 <div class="slots" id="slots"></div>
+<h3>Load request for TigerSpool</h3>
+<div class="printer">
+  <span class="muted" id="reqhint"></span>
+  <button type="button" id="send">Send to TigerSpool</button>
+</div>
+<div class="slots" id="request"></div>
 <h3>Spools</h3>
 <input id="filter" placeholder="Filter: brand, material, colour, place">
 <table>
@@ -1134,7 +1156,7 @@ INVENTORY_PAGE = r"""<!doctype html>
   <tbody id="spools"></tbody>
 </table>
 <script>
-  let state = null;
+  let state = null, busy = false;
   const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const name = sp => sp.preset || [sp.brand, sp.series || sp.material, sp.colour_name].filter(Boolean).join(' ');
   const grams = g => g == null ? '?' : Math.round(g) + ' g';
@@ -1177,9 +1199,30 @@ INVENTORY_PAGE = r"""<!doctype html>
       ? '' : 'Sync once to list the printers of your account.';
   }
 
+  function requestCard(s) {
+    return '<div class="card"><div class="top"><span style="white-space:nowrap">Slot ' + esc(s.key) + '</span> ' + swatch(s.color) + ' ' + esc(s.preset) + '</div>' +
+      (s.grams_needed ? '<div>Needs ' + grams(s.grams_needed) + '</div>' : '') +
+      '<div>' + (s.place ? 'Take it from ' + esc(s.place) : '<span class="muted">No place stored</span>') + '</div>' +
+      '<div class="muted">Chip ' + esc(s.uids.join(' + ')) + '</div></div>';
+  }
+
+  function renderRequest() {
+    const r = state.request, p = state.printer;
+    const target = r && r.printer_id && p ? (p.known.find(k => k.id === r.printer_id) || {name: r.printer_id}).name : '';
+    let hint;
+    if (!target) hint = 'Choose the TigerTag printer above to send a load request.';
+    else if (!r.slots.length) hint = 'No slot holds a TigerTag spool' + (state.sliced ? ' that this plate uses.' : '.');
+    else hint = 'For ' + target + (state.sliced ? ': the slots this plate uses.'
+                                               : ': every slot with a TigerTag spool. Slice to ask only for the slots the plate uses.');
+    document.getElementById('reqhint').textContent = hint;
+    document.getElementById('request').innerHTML = target ? r.slots.map(requestCard).join('') : '';
+    if (!busy) document.getElementById('send').disabled = !target || !r.slots.length;
+  }
+
   function render() {
     if (!state) return;
     renderPrinter();
+    renderRequest();
     document.getElementById('synced').textContent = state.synced_at
       ? 'Synced ' + new Date(state.synced_at * 1000).toLocaleString()
       : 'Not synced yet: run "TigerTag: sync filament presets" in the Plugins window.';
@@ -1206,11 +1249,13 @@ INVENTORY_PAGE = r"""<!doctype html>
     if (msg.command === 'state') { state = msg.state; document.getElementById('error').textContent = ''; render(); }
     if (msg.command === 'error') document.getElementById('error').textContent = msg.text;
     if (msg.command === 'changed') refresh();
-    if (msg.command === 'syncing') {
-      document.getElementById('sync').disabled = true;
-      document.getElementById('status').textContent = 'Syncing...';
+    if (msg.command === 'busy') {
+      busy = true;
+      document.getElementById('sync').disabled = document.getElementById('send').disabled = true;
+      document.getElementById('status').textContent = msg.text;
     }
-    if (msg.command === 'synced') {
+    if (msg.command === 'done') {
+      busy = false;
       document.getElementById('sync').disabled = false;
       document.getElementById('status').textContent = msg.ok ? msg.text : '';
       document.getElementById('error').textContent = msg.ok ? '' : msg.text;
@@ -1223,6 +1268,7 @@ INVENTORY_PAGE = r"""<!doctype html>
   setInterval(() => { if (document.visibilityState === 'visible') refresh(); }, 5000);
   document.getElementById('refresh').onclick = refresh;
   document.getElementById('sync').onclick = () => window.orca.postMessage({command: 'sync'});
+  document.getElementById('send').onclick = () => window.orca.postMessage({command: 'send'});
   document.getElementById('filter').oninput = render;
   document.getElementById('printer').onchange = e => {
     const v = e.target.value;
@@ -1324,12 +1370,20 @@ def inventory_state(used):
 
     slots = list(bundle.current_filament_preset_names())
     orca_printer = bundle.current_printer_preset().name
+    rows = slot_rows(slots, uid_of_preset, spools, used)
+    printer_id = load_printer_map().get(orca_printer) or None
+    try:
+        with open(os.path.join(state_dir(), SLOT_KEYS_FILE), encoding="utf-8") as handle:
+            slot_keys = json.load(handle).get(printer_id, []) if printer_id else []
+    except (OSError, ValueError, AttributeError):
+        slot_keys = []
     return {
         "synced_at": cache.get("synced_at"),
+        "request": load_request_preview(rows, used is not None, printer_id, slot_keys),
         "printer": {"orca": orca_printer, "choice": load_printer_map().get(orca_printer),
                     "known": cache.get("printers", [])},
         "spools": spools,
-        "slots": slot_rows(slots, uid_of_preset, spools, used),
+        "slots": rows,
         "sliced": used is not None,
     }
 
@@ -1448,25 +1502,25 @@ if orca is not None:
 
         _sync_lock = threading.Lock()
 
-        def start_sync(self):
-            """The sync button. on_message runs on the UI thread, which must not wait for
-            the network; the sync runs on its own thread. Host calls that touch the UI
-            (reload_local, begin_update) marshal to the UI thread and release the GIL
-            while they wait, so this thread does not block Orca."""
+        def start_job(self, label, work):
+            """The sync and send buttons. on_message runs on the UI thread, which must not
+            wait for the network; the work runs on its own thread. Host calls that touch
+            the UI (reload_local, begin_update) marshal to the UI thread and release the
+            GIL while they wait, so this thread does not block Orca."""
             if not self._sync_lock.acquire(blocking=False):
-                return  # one sync at a time
-            self.post_message({"command": "syncing"})
-            threading.Thread(target=self._sync_thread, name="TigerTag sync", daemon=True).start()
+                return  # one job at a time
+            self.post_message({"command": "busy", "text": label})
+            threading.Thread(target=self._job_thread, args=(work,), name="TigerTag", daemon=True).start()
 
-        def _sync_thread(self):
+        def _job_thread(self, work):
             try:
-                message, ok = sync(StoredSession()), True
+                message, ok = work(StoredSession()), True
             except Exception as error:  # noqa: BLE001 - a thread must report every failure itself
                 message, ok = f"TigerTag: {error}", False
             finally:
                 self._sync_lock.release()
             notify(message, error=not ok)
-            self.post_message({"command": "synced", "ok": ok, "text": message})
+            self.post_message({"command": "done", "ok": ok, "text": message})
 
         def get_name(self):
             return "TigerTag"
@@ -1492,7 +1546,9 @@ if orca is not None:
             if command in ("ready", "refresh"):
                 self.post_state()
             elif command == "sync":
-                self.start_sync()
+                self.start_job("Syncing...", sync)
+            elif command == "send":
+                self.start_job("Sending to TigerSpool...", send_load_request)
             elif command == "set_printer":
                 self.set_printer(message)
 

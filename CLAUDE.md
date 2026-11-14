@@ -136,8 +136,12 @@ nozzle range and density in the filament tab.
 2b. **Load request, Orca -> TigerSpool.** Action "TigerTag: send slots to
    TigerSpool" writes `users/{uid}/load_requests/{printerId}`; TigerSpool shows
    at the printer which spool goes into which slot and where it is stored.
-   Written 2026-11-14, unit-tested, not run in Orca. Format agreed with the
-   TigerSpool session (2026-11-14):
+   Written 2026-11-14; the action ran in Orca (HTTP 403, see below). The tab
+   shows the request it would send (`load_request_preview`, for the printer
+   chosen in the tab; slot keys of the last sync in
+   `<data_dir>/tigertag_plugin/slot_keys.json`) and sends it with its own
+   button on the job thread (written 2026-11-14, not run in Orca). Format
+   agreed with the TigerSpool session (2026-11-14):
    `{source: "orcaslicer", requested_at: ms, job, slots: {<printer slot key>:
    {uid, uids: [both chips], preset, material, color, grams_needed,
    rack: {id, name, level, position} | null, place}}}`. Only slots holding a

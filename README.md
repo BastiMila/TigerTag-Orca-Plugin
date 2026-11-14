@@ -50,7 +50,9 @@ it tells your TigerSpool which spool goes into which slot of the selected
 printer, and where each spool is stored. After a slice it asks only for the
 slots the plate uses. It writes one document per printer to your account
 (`load_requests`), and nothing else. The TigerTag account must allow this;
-until it does, the action reports that it was refused.
+until it does, the action reports that it was refused. The TigerTag tab shows
+the request before it is sent - slot, spool, grams needed, where to take it
+from - and has its own *Send to TigerSpool* button.
 
 ## Development
 
