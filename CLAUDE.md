@@ -38,8 +38,9 @@ nozzle range and density in the filament tab.
    and the plugin assigns presets with
    `orca.host.preset.filament.begin_update(slot, preset_name)` (the assignment
    happens inside `begin_update`; no `commit()` needed). Plugin side written
-   2026-11-13, unit-tested, not yet run in Orca: no device publishes `slots`
-   yet (TigerSpool branch `afc-weight-writeback`, compiled, not on the device).
+   2026-11-13. Run against a real TigerSpool on 2026-11-14: the FlashForge
+   Creator 5 Pro's published slots 1, 2, 4 got their presets (slot 4 the
+   owner's saved copy "... Selbst"), the null slot 3 kept its preset.
    - Format (TigerSpool `docs/PRESENCE.md`): `users/{uid}/tigerspools/{mac}`
      field `slots` = { printer id from `printer_ids`: { slot key: {`uid`
      (inventory doc id, upper-case; one chip of a twin spool), `material`,
@@ -62,7 +63,13 @@ nozzle range and density in the filament tab.
      without an entry it takes the one printer with slot data whose brand or
      `printerName` matches `printer_model`, and saves that choice in
      `<data_dir>/tigertag_plugin/printers.json` (shared by all actions; the
-     config of each action can override it).
+     config of each action can override it). Several printers: one entry per
+     Orca printer preset; two identical printers need two Orca presets.
+   - The tab chooses the entry for the active printer preset (written
+     2026-11-14, tested in Orca the same day): automatic (no entry), none
+     (`""`), or an account printer. The list comes from `inventory.json`
+     (`printers`, written by every sync), so the tab makes no request. A
+     Script's config `printers` still overrides it and the tab cannot see it.
    - A user's saved copy of a TigerTag preset (the only user preset whose
      `filament_notes` carries that chip UID) is loaded instead of the bundle
      preset; a bundle preset is passed by its internal name `_local/tigertag/<name>`.
@@ -86,8 +93,17 @@ nozzle range and density in the filament tab.
      The tab therefore makes no request: every sync writes
      `<data_dir>/tigertag_plugin/inventory.json`, the tab reads it.
    - Config is per capability: the tab cannot read the Script's e-mail or
-     `printers`, so it has no sync button yet. Everything shared (session,
-     printer mapping, inventory) therefore lives in `<data_dir>/tigertag_plugin/`.
+     `printers`. Everything shared (session, printer mapping, inventory)
+     therefore lives in `<data_dir>/tigertag_plugin/`.
+   - Sync button in the tab (written and tested in Orca 2026-11-14, slots
+     assigned from the thread): the
+     click arrives on the UI thread, so the sync runs on its own
+     `threading.Thread` (permission `threading=True`, asked at load). It signs
+     in with the stored session only (`StoredSession`), never a password.
+     Host calls that touch the UI marshal to the UI thread and release the GIL
+     while waiting (`run_on_ui_blocking` in `PluginHostUi.cpp`), so the thread
+     cannot block Orca. `begin_update` from this thread works like from the
+     Script worker.
    - Tested 2026-11-14: tab shows slots, places and the need of a slice
      (252 g on a 58 g spool -> red warning). The need is shown only while the
      G-code's `filament_settings_id` equals the current slot presets.
@@ -132,7 +148,9 @@ nozzle range and density in the filament tab.
    from `rack` (i18n, font coverage).
    - TigerSpool reads it with one `documents:batchGet` over `printer_ids`,
      every second heartbeat (only one TLS session fits in its RAM).
-   - Confirmed 2026-11-14 in Orca: the send action gets HTTP 403.
+   - Confirmed 2026-11-14 in Orca 2.5.1: the send action gets HTTP 403, and
+     Orca no longer crashes (with the tab changes below and 2.5.1 together,
+     so which of the two fixed it is unknown).
    - Firestore has no wildcard rule under `users/{uid}`: until TigerTag adds
      `match /users/{uid}/load_requests/{printerId}` (read, write if
      auth.uid == uid), the write fails with 403 and the plugin says so. The
@@ -152,7 +170,7 @@ it to the TigerTag developers - do not ask them beforehand.
 
 ## OrcaSlicer 2.5 plugins - what is documented
 
-2.5.0 has been a release candidate since 2026-11-01; "the plugin system is new
+2.5.0 was released 2026-11-07, 2.5.1 on 2026-11-14; "the plugin system is new
 and its API may still change". Check the docs again before relying on a detail.
 
 - Python, on an embedded CPython that ships with Orca. Dependencies are resolved
@@ -199,7 +217,10 @@ and its API may still change". Check the docs again before relying on a detail.
 - Example plugins exist in the Orca repository after all: `sandboxes/*.py`
   (dock panel, inspector, G-code stamp, ...), plus design docs
   `docs/HLSD/preset-plugin-api.md` and `python-plugin-async-bridge.md`.
-  The installed build is v2.5.0-rc; v2.5.0 is tagged.
+  The owner runs v2.5.1 since 2026-11-14 (before: v2.5.0-rc, build af2ffb8c).
+  Between the RC and 2.5.1 no commit touched the preset, page or lifecycle
+  bindings; new is a Permissions tab in the Plugins window (grants can be
+  viewed and edited there).
 
 Docs: release notes https://www.orcaslicer.com/wiki/releases/release_2_5_0_alpha ,
 plugin development https://www.orcaslicer.com/wiki/developer_reference/plugin_development/plugin_development.html ,

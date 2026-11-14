@@ -33,6 +33,7 @@ tested and tools/dry_run.py can run a sync outside the slicer.
 """
 import glob
 import json
+import threading
 import os
 import re
 import time
@@ -714,10 +715,17 @@ def rack_label(rack, rack_names):
     return f"{name}, {spot}" if spot else name
 
 
-def inventory_cache(spools, names, built, rack_names, now):
-    """What the TigerTag tab shows, written by every sync: the tab itself makes no request."""
+def inventory_cache(spools, names, built, rack_names, now, printers=None):
+    """What the TigerTag tab shows, written by every sync: the tab itself makes no request.
+
+    printers is fetch_printer_names() (id -> (brand, name)); the tab offers them for
+    the active Orca printer preset.
+    """
     return {
         "synced_at": now,
+        "printers": [{"id": printer_id, "brand": brand, "name": name}
+                     for printer_id, (brand, name) in sorted((printers or {}).items(),
+                                                             key=lambda item: (item[1][1].lower(), item[0]))],
         "spools": [dict(spool, preset=names.get(spool["uid"]) if names.get(spool["uid"]) in built else None,
                         place=rack_label(spool["rack"], rack_names),
                         rack=dict(spool["rack"], name=rack_names.get(spool["rack"]["id"], ""))
@@ -961,14 +969,16 @@ def sync(capability):
         rack_names = fetch_rack_names(session["uid"], session["id_token"])
     except TigerTagError:
         rack_names = {}  # the tab then shows rack ids instead of names
+    printers = fetch_printer_names(session["uid"], session["id_token"])
     write_text(os.path.join(state_dir(), INVENTORY_CACHE_FILE),
-               json.dumps(inventory_cache(spools, preset_names(spools), set(presets), rack_names, int(time.time()))))
+               json.dumps(inventory_cache(spools, preset_names(spools), set(presets), rack_names, int(time.time()),
+                                          printers)))
 
     message = f"TigerTag: {len(presets)} filament preset(s) from {len(spools)} spool(s)."
     if skipped:
         message += " Skipped: " + "; ".join(skipped) + "."
     try:
-        slots = assign_slots(capability, config, session, spools, set(presets))
+        slots = assign_slots(capability, config, session, spools, set(presets), printers)
     except TigerTagError as error:  # the presets are in place; only the slots failed
         slots = f"Slots: {error}"
     if slots:
@@ -985,9 +995,20 @@ def load_printer_map():
     return {str(key): str(value or "") for key, value in stored.items()} if isinstance(stored, dict) else {}
 
 
+def printer_choice(mapping, orca_printer, choice):
+    """mapping with the tab's choice for orca_printer: None = automatic (no entry),
+    "" = no TigerTag printer, otherwise an account printer id."""
+    mapping = dict(mapping)
+    if choice is None:
+        mapping.pop(orca_printer, None)
+    else:
+        mapping[orca_printer] = choice
+    return mapping
+
+
 def remember_printer(orca_printer, printer_id):
-    stored = load_printer_map()
-    stored[orca_printer] = printer_id
+    """Set (with None: forget) the account printer of an Orca printer preset in printers.json."""
+    stored = printer_choice(load_printer_map(), orca_printer, printer_id)
     write_text(os.path.join(state_dir(), PRINTER_MAP_FILE), json.dumps(stored, indent=2, ensure_ascii=False))
 
 
@@ -1002,7 +1023,7 @@ def printer_mapping(config):
     return {str(key): str(value or "") for key, value in mapping.items()} if isinstance(mapping, dict) else {}
 
 
-def assign_slots(capability, config, session, spools, built):
+def assign_slots(capability, config, session, spools, built, known_printers=None):
     """Load the spool TigerSpool put into each slot of the active printer. Returns a message or ""."""
     slot_maps = load_test_slots(os.path.join(plugin_dir(), TEST_SLOTS_FILE))
     source = f" (from {TEST_SLOTS_FILE})" if slot_maps is not None else ""
@@ -1017,7 +1038,7 @@ def assign_slots(capability, config, session, spools, built):
     printer_model = printer.config_value("printer_model") or ""
     mapping = dict(load_printer_map(), **printer_mapping(config))
 
-    names = {}
+    names = dict(known_printers or {})
 
     def printer_names():
         if not names:
@@ -1031,8 +1052,7 @@ def assign_slots(capability, config, session, spools, built):
             return ""  # the user said: no TigerSpool slots for this printer
         known = ", ".join(f"{printer_names().get(pid, (None, pid))[1]} = {pid}" for pid in candidates)
         return (f"Slots: not loaded, which TigerTag printer is '{printer.name}'? "
-                f"In the Config tab, add it to \"printers\" as \"{printer.name}\": \"<printer id>\" "
-                f"({known}).")
+                f"Choose it in the TigerTag tab ({known}).")
     if how == "matched":
         remember_printer(printer.name, printer_id)
 
@@ -1087,14 +1107,24 @@ INVENTORY_PAGE = r"""<!doctype html>
   td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
   .bar { width: 80px; height: 6px; background: var(--line); border-radius: 3px; display: inline-block; vertical-align: middle; margin-left: 6px; }
   .bar i { display: block; height: 100%; border-radius: 3px; background: var(--ok); }
+  .printer { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+  .printer select { padding: 3px 4px; }
 </style>
 <header>
   <h2>TigerTag</h2>
   <span class="muted" id="synced"></span>
+  <button type="button" id="sync">Sync with TigerTag</button>
   <button type="button" id="refresh">Refresh</button>
 </header>
+<div id="status" class="muted"></div>
 <div id="error" class="warn"></div>
 <h3>Filament slots</h3>
+<div class="printer">
+  <span id="orcaprinter"></span>
+  <span>is the TigerTag printer</span>
+  <select id="printer"></select>
+  <span class="muted" id="printerhint"></span>
+</div>
 <div class="muted" id="slicehint"></div>
 <div class="slots" id="slots"></div>
 <h3>Spools</h3>
@@ -1127,8 +1157,29 @@ INVENTORY_PAGE = r"""<!doctype html>
       (sp ? swatch(sp.colour) : '') + ' ' + esc(row.preset) + '</div>' + body + '</div>';
   }
 
+  // Rebuilt only when something changed, never while open: the page refreshes every 5 s.
+  let printerKey = null;
+  function renderPrinter() {
+    const p = state.printer;
+    if (!p) return;
+    const select = document.getElementById('printer');
+    const value = p.choice == null ? 'auto' : (p.choice === '' ? 'none' : 'id:' + p.choice);
+    const key = JSON.stringify([p.orca, value, p.known]);
+    if (key === printerKey || document.activeElement === select) return;
+    printerKey = key;
+    document.getElementById('orcaprinter').textContent = '"' + p.orca + '"';
+    const options = [['auto', 'chosen automatically'], ['none', 'none (no TigerSpool slots)']]
+      .concat(p.known.map(k => ['id:' + k.id, k.name + ' (' + k.brand + ')']));
+    if (value.startsWith('id:') && !p.known.some(k => 'id:' + k.id === value)) options.push([value, p.choice]);
+    select.innerHTML = options.map(o => '<option value="' + esc(o[0]) + '">' + esc(o[1]) + '</option>').join('');
+    select.value = value;
+    document.getElementById('printerhint').textContent = p.known.length
+      ? '' : 'Sync once to list the printers of your account.';
+  }
+
   function render() {
     if (!state) return;
+    renderPrinter();
     document.getElementById('synced').textContent = state.synced_at
       ? 'Synced ' + new Date(state.synced_at * 1000).toLocaleString()
       : 'Not synced yet: run "TigerTag: sync filament presets" in the Plugins window.';
@@ -1155,13 +1206,31 @@ INVENTORY_PAGE = r"""<!doctype html>
     if (msg.command === 'state') { state = msg.state; document.getElementById('error').textContent = ''; render(); }
     if (msg.command === 'error') document.getElementById('error').textContent = msg.text;
     if (msg.command === 'changed') refresh();
+    if (msg.command === 'syncing') {
+      document.getElementById('sync').disabled = true;
+      document.getElementById('status').textContent = 'Syncing...';
+    }
+    if (msg.command === 'synced') {
+      document.getElementById('sync').disabled = false;
+      document.getElementById('status').textContent = msg.ok ? msg.text : '';
+      document.getElementById('error').textContent = msg.ok ? '' : msg.text;
+      refresh();
+    }
   });
   // Slots change in the sidebar without telling the page; ask again every few
   // seconds while the tab is visible (the plugin reads presets only when asked).
   function refresh() { window.orca.postMessage({command: 'refresh'}); }
   setInterval(() => { if (document.visibilityState === 'visible') refresh(); }, 5000);
   document.getElementById('refresh').onclick = refresh;
+  document.getElementById('sync').onclick = () => window.orca.postMessage({command: 'sync'});
   document.getElementById('filter').oninput = render;
+  document.getElementById('printer').onchange = e => {
+    const v = e.target.value;
+    window.orca.postMessage({command: 'set_printer', orca: state.printer.orca,
+                             id: v === 'auto' ? null : (v === 'none' ? '' : v.slice(3))});
+    document.getElementById('status').textContent = 'Saved. Sync with TigerTag to load the slots of this printer.';
+    e.target.blur();
+  };
   window.orca.postMessage({command: 'ready'});
 </script>
 """
@@ -1254,8 +1323,11 @@ def inventory_state(used):
         return match.group(1).upper() if match else None
 
     slots = list(bundle.current_filament_preset_names())
+    orca_printer = bundle.current_printer_preset().name
     return {
         "synced_at": cache.get("synced_at"),
+        "printer": {"orca": orca_printer, "choice": load_printer_map().get(orca_printer),
+                    "known": cache.get("printers", [])},
         "spools": spools,
         "slots": slot_rows(slots, uid_of_preset, spools, used),
         "sliced": used is not None,
@@ -1280,8 +1352,8 @@ def send_load_request(capability):
                                      sorted(names), lambda pid: names.get(pid, (None, None)))
     if printer_id is None:
         known = ", ".join(f"{name} = {pid}" for pid, (_brand, name) in sorted(names.items()))
-        raise TigerTagError(f"Which TigerTag printer is '{printer.name}'? In this action's Config tab, add "
-                            f"\"printers\": {{\"{printer.name}\": \"<printer id>\"}} ({known}).")
+        raise TigerTagError(f"Which TigerTag printer is '{printer.name}'? "
+                            f"Choose it in the TigerTag tab ({known}).")
     if how == "matched":
         remember_printer(printer.name, printer_id)
 
@@ -1301,6 +1373,23 @@ def send_load_request(capability):
     parts = [f"{key} {slot['preset']}" + (f" ({slot['grams_needed']} g)" if slot["grams_needed"] else "")
              for key, slot in sorted(request["slots"].items(), key=lambda item: (len(item[0]), item[0]))]
     return f"TigerTag: sent to {label}: " + ", ".join(parts) + "."
+
+
+class StoredSession:
+    """Stands in for the Script capability when the tab starts a sync.
+
+    The tab cannot read the Script's config (config is per capability), so it signs
+    in with the session the Script stored, never with a password.
+    """
+
+    def get_config(self):
+        email = load_session(os.path.join(state_dir(), SESSION_FILE)).get("email", "")
+        if not email:
+            raise TigerTagError("Run \"TigerTag: sync filament presets\" in the Plugins window once; it signs in.")
+        return json.dumps({"email": email, "password": ""})
+
+    def save_config(self, _text):
+        pass  # never called: there is no password to clear
 
 
 def notify(text, error=False):
@@ -1357,6 +1446,28 @@ if orca is not None:
     class TigerTagInventory(orca.pages.PagesPluginCapabilityBase):
         """The TigerTag tab: spools, places, what is left, and the slots of the last slice."""
 
+        _sync_lock = threading.Lock()
+
+        def start_sync(self):
+            """The sync button. on_message runs on the UI thread, which must not wait for
+            the network; the sync runs on its own thread. Host calls that touch the UI
+            (reload_local, begin_update) marshal to the UI thread and release the GIL
+            while they wait, so this thread does not block Orca."""
+            if not self._sync_lock.acquire(blocking=False):
+                return  # one sync at a time
+            self.post_message({"command": "syncing"})
+            threading.Thread(target=self._sync_thread, name="TigerTag sync", daemon=True).start()
+
+        def _sync_thread(self):
+            try:
+                message, ok = sync(StoredSession()), True
+            except Exception as error:  # noqa: BLE001 - a thread must report every failure itself
+                message, ok = f"TigerTag: {error}", False
+            finally:
+                self._sync_lock.release()
+            notify(message, error=not ok)
+            self.post_message({"command": "synced", "ok": ok, "text": message})
+
         def get_name(self):
             return "TigerTag"
 
@@ -1377,8 +1488,25 @@ if orca is not None:
                     message = json.loads(message)
                 except ValueError:
                     return
-            if isinstance(message, dict) and message.get("command") in ("ready", "refresh"):
+            command = message.get("command") if isinstance(message, dict) else None
+            if command in ("ready", "refresh"):
                 self.post_state()
+            elif command == "sync":
+                self.start_sync()
+            elif command == "set_printer":
+                self.set_printer(message)
+
+        def set_printer(self, message):
+            """The printer choice: written to printers.json, which every action reads."""
+            orca_printer, choice = message.get("orca"), message.get("id")
+            if not isinstance(orca_printer, str) or not (choice is None or isinstance(choice, str)):
+                return
+            try:
+                remember_printer(orca_printer, choice)
+            except OSError as error:
+                self.post_message({"command": "error", "text": f"Saving the printer failed: {error}"})
+                return
+            self.post_state()
 
         def on_lifecycle_event(self, event, ctx):
             # Touch nothing here: events fire in the middle of preset switches and AMS syncs.
@@ -1392,7 +1520,8 @@ if orca is not None:
             # One grant for the whole slice folder, asked once at load: the tab reads
             # the G-code of each slice there. Without it every folder read prompts.
             folder = slice_folder()
-            orca.request_permissions(network=NETWORK_HOSTS, fs_read=[os.path.join(folder, "*")] if folder else [])
+            orca.request_permissions(network=NETWORK_HOSTS, fs_read=[os.path.join(folder, "*")] if folder else [],
+                                     threading=True)  # the tab's sync button runs on its own thread
             orca.register_capability(TigerTagSync)
             orca.register_capability(TigerTagSend)
             orca.register_capability(TigerTagInventory)

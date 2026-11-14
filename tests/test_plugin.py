@@ -269,6 +269,15 @@ class SlotTest(unittest.TestCase):
         self.assertEqual(plugin.printer_mapping({"printers": {"C5": "abc"}}), {"C5": "abc"})
         self.assertEqual(plugin.printer_mapping({"printers": '{"C5": "abc"}'}), {"C5": "abc"})
         self.assertEqual(plugin.printer_mapping({}), {})
+
+    def test_printer_choice_from_the_tab(self):
+        stored = {"C5": "abc", "Voron": ""}
+        self.assertEqual(plugin.printer_choice(stored, "C5", None), {"Voron": ""})  # automatic again
+        self.assertEqual(plugin.printer_choice(stored, "C5", ""), {"C5": "", "Voron": ""})  # no printer
+        self.assertEqual(plugin.printer_choice(stored, "New", "xyz")["New"], "xyz")
+        self.assertEqual(stored, {"C5": "abc", "Voron": ""})  # not changed in place
+        self.assertEqual(plugin.choose_printer("C5", "", plugin.printer_choice(stored, "C5", ""),
+                                               ["abc"], lambda _pid: (None, None)), (None, "configured"))
         with self.assertRaises(plugin.TigerTagError):
             plugin.printer_mapping({"printers": "{nope"})
 
@@ -315,6 +324,11 @@ class InventoryTest(unittest.TestCase):
         self.assertEqual(cache["spools"][0]["preset"], "Sunlu PLA+ Olive Green")
         self.assertEqual(cache["spools"][0]["place"], "Regal, A1")
         self.assertIsNone(plugin.inventory_cache(spools, names, set(), {}, 5)["spools"][0]["preset"])
+        self.assertEqual(cache["printers"], [])
+        printers = {"p2": ("klipper", "testprinter"), "p1": ("klipper", "FlashForge Creator 5 Pro")}
+        listed = plugin.inventory_cache(spools, names, set(), {}, 5, printers)["printers"]
+        self.assertEqual([p["id"] for p in listed], ["p1", "p2"])  # by name, case-insensitive
+        self.assertEqual(listed[1], {"id": "p2", "brand": "klipper", "name": "testprinter"})
         json.dumps(cache)  # the tab gets it as JSON
 
     def test_filament_used(self):
