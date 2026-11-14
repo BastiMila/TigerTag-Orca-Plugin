@@ -4,6 +4,8 @@ Signs in with the e-mail and password in LOCAL.md, reads the inventory and write
 the bundle into OUT_DIR instead of Orca's data folder. Base presets are matched
 against tests/fixtures/orca_system_filaments.txt; without Orca there are no base
 values, so temperatures are not clamped and vectors have one element.
+Then prints the slot maps the TigerSpools published and what each slot would
+load (user copies of presets are unknown outside Orca).
 
 Usage: python -I tools/dry_run.py LOCAL.md OUT_DIR
 Prints no token and no password.
@@ -52,6 +54,19 @@ def main():
         print(f"  {name:55} <- {preset['inherits']}")
     for line in skipped:
         print("  SKIPPED", line)
+
+    slot_maps = plugin.fetch_slot_maps(session["uid"], session["id_token"])
+    printers = plugin.fetch_printer_names(session["uid"], session["id_token"]) if slot_maps else {}
+    preset_of = plugin.presets_by_uid(spools, plugin.preset_names(spools), set(presets), {})
+    print(f"{len(slot_maps)} printer(s) with TigerSpool slot data")
+    for printer_id, slot_map in sorted(slot_maps.items()):
+        brand, name = printers.get(printer_id, ("?", printer_id))
+        print(f"  {name} ({brand}, {printer_id}): {len(slot_map)} slot(s)")
+        plan, notes = plugin.plan_slots(slot_map, preset_of.get, 99)
+        for slot, target, uid in plan:
+            print(f"    slot {slot}: {uid} -> {plugin.display_name(target)}")
+        for note in notes:
+            print("    " + note)
 
 
 if __name__ == "__main__":

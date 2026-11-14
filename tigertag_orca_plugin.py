@@ -7,7 +7,7 @@
 # author = "BastiMila"
 # version = "0.1.0"
 # ///
-"""TigerTag for OrcaSlicer - stage 1: filament presets from the inventory.
+"""TigerTag for OrcaSlicer - filament presets from the inventory, and per filament slot.
 
 Run "TigerTag: sync filament presets" from the Plugins window. The plugin signs in
 to the TigerTag account, reads users/{uid}/inventory and writes one filament preset
@@ -18,6 +18,12 @@ Every preset inherits an installed "@System" filament preset (brand + series
 first, then "Generic <material>") and overrides only what the spool knows:
 vendor, colour, diameter, density, the nozzle and bed temperature ranges, and a
 note with the chip UID and the filament left.
+
+Then it loads the right preset into each filament slot of the active printer:
+every TigerSpool publishes, in users/{uid}/tigerspools/{mac}.slots, which chip UID
+it put into which printer slot. The Orca printer preset is tied to an account
+printer once (config "printers", filled automatically when only one printer with
+slot data looks like the printer model).
 
 The account is only read. Nothing is written back to TigerTag.
 
@@ -71,6 +77,12 @@ INVENTORY_MASK = [
 
 NOZZLE_TEMP_KEYS = ("nozzle_temperature", "nozzle_temperature_initial_layer")
 # Per build plate. A value of 0 means "this plate is not supported" and is kept.
+# Brands under users/{uid}/printers/{brand}/devices, as TigerSpool reads them.
+# Printer documents hold credentials: only the name is ever fetched.
+PRINTER_BRANDS = ("creality", "flashforge", "bambulab", "snapmaker", "elegoo", "anycubic", "klipper")
+NOTE_UID = re.compile(r"TigerTag spool ([0-9A-Za-z_]+)")
+LOCAL_PREFIX = "_local/" + BUNDLE_ID + "/"  # internal name of a bundle preset
+
 BED_TEMP_KEYS = tuple(
     plate + suffix
     for plate in ("cool_plate_temp", "textured_cool_plate_temp", "eng_plate_temp",
@@ -153,16 +165,16 @@ def firestore_plain(value):
     return inner
 
 
-def fetch_inventory(uid, id_token):
-    """Every document of users/{uid}/inventory as (document id, plain fields)."""
+def fetch_documents(what, path, mask, id_token):
+    """Every document of the collection at path as (document id, plain fields), only the masked fields."""
     documents = []
     page_token = ""
     while True:
-        query = [("pageSize", "300")] + [("mask.fieldPaths", path) for path in INVENTORY_MASK]
+        query = [("pageSize", "300")] + [("mask.fieldPaths", field) for field in mask]
         if page_token:
             query.append(("pageToken", page_token))
-        url = f"{FIRESTORE_URL}/users/{urllib.parse.quote(uid)}/inventory?" + urllib.parse.urlencode(query)
-        answer = http_json("Reading the inventory", url, token=id_token)
+        url = f"{FIRESTORE_URL}/{urllib.parse.quote(path)}?" + urllib.parse.urlencode(query)
+        answer = http_json(what, url, token=id_token)
         for document in answer.get("documents", []):
             doc_id = document["name"].rsplit("/", 1)[-1]
             fields = {key: firestore_plain(item) for key, item in document.get("fields", {}).items()}
@@ -170,6 +182,11 @@ def fetch_inventory(uid, id_token):
         page_token = answer.get("nextPageToken", "")
         if not page_token:
             return documents
+
+
+def fetch_inventory(uid, id_token):
+    """Every document of users/{uid}/inventory as (document id, plain fields)."""
+    return fetch_documents("Reading the inventory", f"users/{uid}/inventory", INVENTORY_MASK, id_token)
 
 
 # --------------------------------------------------------------------------- TigerTag database
@@ -453,6 +470,168 @@ def build_presets(spools, available_names, base_value_of, synced_at):
     return presets, skipped
 
 
+# --------------------------------------------------------------------------- filament slots
+
+def merge_slot_maps(boxes):
+    """users/{uid}/tigerspools documents -> printer id -> {printer's slot key: entry or None}.
+
+    Each TigerSpool publishes which spool it put into which printer slot. A printer
+    served by two boxes appears in both; per slot the newest entry (set_at) wins
+    over an older one and over a null, which only says that box no longer vouches
+    for the slot.
+    """
+    merged = {}
+    for _box, fields in boxes:
+        slot_maps = fields.get("slots")
+        if not isinstance(slot_maps, dict):
+            continue
+        for printer_id, slots in slot_maps.items():
+            if not isinstance(slots, dict):
+                continue
+            target = merged.setdefault(printer_id, {})
+            for key, entry in slots.items():
+                if not (isinstance(entry, dict) and entry.get("uid")):
+                    target.setdefault(key, None)
+                    continue
+                old = target.get(key)
+                if old is None or (entry.get("set_at") or 0) > (old.get("set_at") or 0):
+                    target[key] = entry
+    return merged
+
+
+def orca_slot_number(key, keys):
+    """A printer's slot key -> Orca's 1-based filament slot, or None.
+
+    FlashForge slots and AFC lanes count from 1, Happy Hare gates from 0, so a map
+    holding a "0" key is taken as 0-based.
+    """
+    try:
+        number = int(key)
+    except (TypeError, ValueError):
+        return None
+    if any(str(other).strip() == "0" for other in keys):
+        number += 1
+    return number if number >= 1 else None
+
+
+def _squeezed(text):
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
+def printer_matches(brand, account_name, printer_model):
+    """True when an account printer looks like Orca's printer_model.
+
+    Either its brand path ("flashforge", "bambulab") is part of the model, or its
+    name and the model are the same apart from case and punctuation. The brand
+    alone is not enough everywhere: a FlashForge Creator 5 Pro is stored under
+    "klipper".
+    """
+    model = _squeezed(printer_model)
+    if not model:
+        return False
+    if brand and brand != "klipper" and brand in model:
+        return True
+    name = _squeezed(account_name)
+    return bool(name) and (name in model or model in name)
+
+
+def choose_printer(orca_printer, printer_model, mapping, candidates, describe):
+    """(account printer id or None, how) for the active Orca printer preset.
+
+    mapping is the config's "printers": Orca printer preset name -> account printer
+    id ("" for none). Without an entry, the one candidate (a printer with slot
+    data) that looks like the printer model is taken; describe(id) returns its
+    (brand, name). how is "configured", "matched", "ambiguous" or "none".
+    """
+    if orca_printer in mapping:
+        return (mapping[orca_printer] or None), "configured"
+    matches = [printer_id for printer_id in candidates if printer_matches(*describe(printer_id), printer_model)]
+    if len(matches) == 1:
+        return matches[0], "matched"
+    return None, "ambiguous" if matches else "none"
+
+
+def user_copies(entries):
+    """(name, filament_notes) of filament presets -> chip uid -> the user's own copy of its preset.
+
+    A saved edit of a TigerTag preset is a separate user preset that keeps the
+    plugin's note with the chip UID. Only a uid with exactly one such copy counts.
+    """
+    found = {}
+    for name, notes in entries:
+        if name.startswith("_local/"):
+            continue
+        match = NOTE_UID.search(notes or "")
+        if match:
+            found.setdefault(match.group(1).upper(), []).append(name)
+    return {uid: names[0] for uid, names in found.items() if len(names) == 1}
+
+
+def presets_by_uid(spools, names, built, copies):
+    """chip uid (both chips of a twin-tag spool) -> internal name of the preset to load.
+
+    The user's own copy wins over the bundle preset.
+    """
+    result = {}
+    for spool in spools:
+        name = names.get(spool["uid"])
+        target = copies.get(spool["uid"]) or (LOCAL_PREFIX + name if name in built else None)
+        if target:
+            for uid in (spool["uid"], spool["twin_uid"]):
+                if uid:
+                    result[uid] = target
+    return result
+
+
+def display_name(internal_name):
+    return internal_name[len(LOCAL_PREFIX):] if internal_name.startswith(LOCAL_PREFIX) else internal_name
+
+
+def plan_slots(slot_map, preset_of, slot_count):
+    """([(Orca slot, preset to load, uid)], [note]) for one printer's slot map.
+
+    A null slot (empty, or changed at the printer) is left as it is.
+    """
+    plan, notes = [], []
+    keys = list(slot_map)
+    for key in sorted(keys, key=lambda item: (len(str(item)), str(item))):
+        entry = slot_map[key]
+        slot = orca_slot_number(key, keys)
+        if slot is None:
+            notes.append(f"slot key '{key}' not understood")
+            continue
+        if entry is None:
+            continue
+        uid = str(entry["uid"]).upper()
+        preset = preset_of(uid)
+        if preset is None:
+            notes.append(f"slot {slot}: spool {uid} has no TigerTag preset")
+        elif slot > slot_count:
+            notes.append(f"slot {slot}: the project has only {slot_count} filament(s)")
+        else:
+            plan.append((slot, preset, uid))
+    return plan, notes
+
+
+def fetch_slot_maps(uid, id_token):
+    boxes = fetch_documents("Reading the TigerSpool slots", f"users/{uid}/tigerspools", ["slots"], id_token)
+    return merge_slot_maps(boxes)
+
+
+def fetch_printer_names(uid, id_token):
+    """Account printer id -> (brand, printer name). Only the name is fetched, never a credential."""
+    printers = {}
+    for brand in PRINTER_BRANDS:
+        try:
+            documents = fetch_documents("Reading the printers", f"users/{uid}/printers/{brand}/devices",
+                                        ["printerName"], id_token)
+        except TigerTagError:
+            continue  # one brand that does not answer only costs its names
+        for printer_id, fields in documents:
+            printers[printer_id] = (brand, fields.get("printerName") or printer_id)
+    return printers
+
+
 # --------------------------------------------------------------------------- bundle on disk
 
 def write_text(path, text):
@@ -559,11 +738,12 @@ def authenticate(config, session_path):
 
 
 def sync(capability):
-    """The whole stage-1 sync inside Orca. Returns the message for the user."""
+    """The whole sync inside Orca: presets, then filament slots. Returns the message for the user."""
     config = json.loads(capability.get_config() or "{}")
     session, changed_config = authenticate(config, os.path.join(plugin_dir(), SESSION_FILE))
     if changed_config is not None:
         capability.save_config(json.dumps(changed_config))
+        config = changed_config
 
     db = load_database(os.path.join(plugin_dir(), DB_CACHE_FILE))
     spools = spools_from_documents(fetch_inventory(session["uid"], session["id_token"]), db)
@@ -589,8 +769,83 @@ def sync(capability):
 
     message = f"TigerTag: {len(presets)} filament preset(s) from {len(spools)} spool(s)."
     if skipped:
-        message += " Skipped: " + "; ".join(skipped)
+        message += " Skipped: " + "; ".join(skipped) + "."
+    try:
+        slots = assign_slots(capability, config, session, spools, set(presets))
+    except TigerTagError as error:  # the presets are in place; only the slots failed
+        slots = f"Slots: {error}"
+    if slots:
+        message += " " + slots
     return message
+
+
+def printer_mapping(config):
+    """The config's "printers" as a dict; the Config tab may hand it back as JSON text."""
+    mapping = config.get("printers")
+    if isinstance(mapping, str):
+        try:
+            mapping = json.loads(mapping or "{}")
+        except ValueError:
+            raise TigerTagError('"printers" in the Config tab is not valid JSON.') from None
+    return {str(key): str(value or "") for key, value in mapping.items()} if isinstance(mapping, dict) else {}
+
+
+def assign_slots(capability, config, session, spools, built):
+    """Load the spool TigerSpool put into each slot of the active printer. Returns a message or ""."""
+    slot_maps = fetch_slot_maps(session["uid"], session["id_token"])
+    candidates = sorted(printer_id for printer_id, slots in slot_maps.items() if any(slots.values()))
+    if not candidates:
+        return ""  # no TigerSpool has published a loaded slot
+
+    bundle = orca.host.preset_bundle()
+    printer = bundle.current_printer_preset()
+    printer_model = printer.config_value("printer_model") or ""
+    mapping = printer_mapping(config)
+
+    names = {}
+
+    def printer_names():
+        if not names:
+            names.update(fetch_printer_names(session["uid"], session["id_token"]))
+        return names
+
+    printer_id, how = choose_printer(printer.name, printer_model, mapping, candidates,
+                                     lambda pid: printer_names().get(pid, (None, None)))
+    if printer_id is None:
+        if how == "configured":
+            return ""  # the user said: no TigerSpool slots for this printer
+        known = ", ".join(f"{printer_names().get(pid, (None, pid))[1]} = {pid}" for pid in candidates)
+        return (f"Slots: not loaded, which TigerTag printer is '{printer.name}'? "
+                f"In the Config tab, add it to \"printers\" as \"{printer.name}\": \"<printer id>\" "
+                f"({known}).")
+    if how == "matched":
+        capability.save_config(json.dumps(dict(config, printers=dict(mapping, **{printer.name: printer_id}))))
+
+    filaments = bundle.filaments
+    entries = []
+    for index in range(filaments.size()):
+        preset = filaments.preset(index)
+        if preset.is_user():
+            entries.append((preset.name, preset.config_value("filament_notes")))
+    preset_of = presets_by_uid(spools, preset_names(spools), built, user_copies(entries))
+
+    current = list(bundle.current_filament_preset_names())
+    plan, notes = plan_slots(slot_maps.get(printer_id, {}), preset_of.get, len(current))
+    loaded = []
+    for slot, target, _uid in plan:
+        if current[slot - 1] != target:
+            try:
+                orca.host.preset.filament.begin_update(slot, target)
+            except (ValueError, RuntimeError, IndexError) as error:
+                notes.append(f"slot {slot}: {error}")
+                continue
+        loaded.append(f"{slot} {display_name(target)}")
+
+    label = printer_names().get(printer_id, (None, printer_id))[1] if how == "matched" else printer.name
+    message = f"Slots of {label}: " + (", ".join(loaded) if loaded else "none loaded")
+    if notes:
+        message += "; " + "; ".join(notes)
+    return message + "."
 
 
 def notify(text, error=False):
@@ -612,7 +867,7 @@ if orca is not None:
             return "TigerTag: sync filament presets"
 
         def get_default_config(self):
-            return {"email": "", "password": ""}
+            return {"email": "", "password": "", "printers": {}}
 
         def execute(self):
             try:

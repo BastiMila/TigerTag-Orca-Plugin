@@ -217,5 +217,70 @@ class AuthenticateTest(unittest.TestCase):
             plugin.sign_in_with_password, plugin.refresh_session = saved
 
 
+class SlotTest(unittest.TestCase):
+    def test_newest_entry_wins_over_older_and_null(self):
+        old = {"uid": "AA01", "material": "PLA", "color": "#000000", "set_at": 100}
+        new = {"uid": "BB02", "material": "PLA", "color": "#000000", "set_at": 200}
+        boxes = [("mac1", {"slots": {"p1": {"1": old, "2": None, "3": None}}}),
+                 ("mac2", {"slots": {"p1": {"1": new, "2": old}, "p2": {"1": None}}}),
+                 ("mac3", {})]
+        merged = plugin.merge_slot_maps(boxes)
+        self.assertEqual(merged["p1"], {"1": new, "2": old, "3": None})
+        self.assertEqual(merged["p2"], {"1": None})
+
+    def test_slot_numbers(self):
+        self.assertEqual(plugin.orca_slot_number("1", ["1", "2"]), 1)
+        self.assertEqual(plugin.orca_slot_number("0", ["0", "3"]), 1)  # Happy Hare gate 0
+        self.assertEqual(plugin.orca_slot_number("3", ["0", "3"]), 4)
+        self.assertIsNone(plugin.orca_slot_number("ext", ["ext"]))
+
+    def test_printer_by_brand_or_name_mapping_or_ambiguity(self):
+        printers = {"ff": ("flashforge", "Workshop"), "kb": ("anycubic", "Kobra"),
+                    "ff2": ("flashforge", "Second"), "c5": ("klipper", "FlashForge Creator 5 Pro"),
+                    "test": ("klipper", "Testprinter")}.get
+        model = "Flashforge Creator 5 Pro"
+        self.assertEqual(plugin.choose_printer("C5", model, {}, ["ff", "kb"], printers), ("ff", "matched"))
+        self.assertEqual(plugin.choose_printer("C5", model, {}, ["c5", "test"], printers), ("c5", "matched"))
+        self.assertEqual(plugin.choose_printer("C5", model, {}, ["ff", "ff2"], printers), (None, "ambiguous"))
+        self.assertEqual(plugin.choose_printer("C5", model, {}, ["kb", "test"], printers), (None, "none"))
+        self.assertEqual(plugin.choose_printer("C5", model, {"C5": "ff2"}, ["ff", "ff2"], printers), ("ff2", "configured"))
+        self.assertEqual(plugin.choose_printer("C5", model, {"C5": ""}, ["ff"], printers), (None, "configured"))
+        self.assertTrue(plugin.printer_matches("bambulab", "X1", "Bambu Lab X1 Carbon"))
+        self.assertFalse(plugin.printer_matches("klipper", "Bench", "Voron 2.4 klipper"))
+        self.assertFalse(plugin.printer_matches("flashforge", "A", ""))
+
+    def test_user_copy_wins_and_twin_chip_maps_to_the_spool(self):
+        spools = plugin.spools_from_documents(
+            [("aa01", document(twin_tag_uid="aa02")), ("bb01", document(name="Red"))], DB)
+        names = plugin.preset_names(spools)
+        copies = plugin.user_copies([
+            ("_local/tigertag/Sunlu PLA+ Red", "TigerTag spool BB01: 1 g"),
+            ("My Olive", '"TigerTag spool AA01: 250 g of 1000 g left (synced 2026-11-13)."'),
+            ("Copy A", "TigerTag spool CC01"), ("Copy B", "TigerTag spool CC01"),
+        ])
+        self.assertEqual(copies, {"AA01": "My Olive"})
+        preset_of = plugin.presets_by_uid(spools, names, set(names.values()), copies)
+        self.assertEqual(preset_of["AA01"], "My Olive")
+        self.assertEqual(preset_of["AA02"], "My Olive")
+        self.assertEqual(preset_of["BB01"], "_local/tigertag/Sunlu PLA+ Red")
+        self.assertEqual(plugin.display_name(preset_of["BB01"]), "Sunlu PLA+ Red")
+
+    def test_printer_mapping_as_dict_or_text(self):
+        self.assertEqual(plugin.printer_mapping({"printers": {"C5": "abc"}}), {"C5": "abc"})
+        self.assertEqual(plugin.printer_mapping({"printers": '{"C5": "abc"}'}), {"C5": "abc"})
+        self.assertEqual(plugin.printer_mapping({}), {})
+        with self.assertRaises(plugin.TigerTagError):
+            plugin.printer_mapping({"printers": "{nope"})
+
+    def test_plan(self):
+        entry = lambda uid: {"uid": uid, "material": "PLA", "color": "#5A6D30", "set_at": 1}
+        slot_map = {"2": entry("bb01"), "1": entry("AA01"), "3": None, "4": entry("ZZ99"), "10": entry("AA01")}
+        preset_of = {"AA01": "A", "BB01": "B"}.get
+        plan, notes = plugin.plan_slots(slot_map, preset_of, 4)
+        self.assertEqual(plan, [(1, "A", "AA01"), (2, "B", "BB01")])
+        self.assertEqual(notes, ["slot 4: spool ZZ99 has no TigerTag preset",
+                                 "slot 10: the project has only 4 filament(s)"])
+
+
 if __name__ == "__main__":
     unittest.main()

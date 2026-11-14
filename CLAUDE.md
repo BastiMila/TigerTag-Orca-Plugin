@@ -27,6 +27,41 @@ nozzle range and density in the filament tab.
 1. **Filament presets from the inventory.** For every spool in the account:
    material, colour, brand, temperatures - written as OrcaSlicer filament
    presets, the way `spoolman2slicer` does it for Spoolman.
+1b. **The right preset per filament slot.** Decided 2026-11-13: not by guessing
+   from the printer's material and palette colour after Orca's AMS sync, but
+   exactly. TigerSpool publishes which chip UID it put into which printer slot,
+   and the plugin assigns presets with
+   `orca.host.preset.filament.begin_update(slot, preset_name)` (the assignment
+   happens inside `begin_update`; no `commit()` needed). Plugin side written
+   2026-11-13, unit-tested, not yet run in Orca: no device publishes `slots`
+   yet (TigerSpool branch `afc-weight-writeback`, compiled, not on the device).
+   - Format (TigerSpool `docs/PRESENCE.md`): `users/{uid}/tigerspools/{mac}`
+     field `slots` = { printer id from `printer_ids`: { slot key: {`uid`
+     (inventory doc id, upper-case; one chip of a twin spool), `material`,
+     `color` ("#RRGGBB", what the printer reported ~3 s after the send),
+     `set_at` (ms, server time; absent before the first beat)} or null } }.
+     null = empty, changed at the printer, or a send still unconfirmed.
+     Slot key = the printer's own number: FlashForge 1-4, AFC lane from 1,
+     Happy Hare gate from 0 (the plugin treats a map with key "0" as
+     0-based); other brands publish nothing yet. Same material and colour
+     swapped without a scan is not noticed.
+   - Printers live in `users/{uid}/printers/{brand}/devices/{id}`, brands
+     creality, flashforge, bambulab, snapmaker, elegoo, anycubic, klipper. The
+     documents hold credentials: fetch only `printerName`. The owner's account
+     has two, both under `klipper`: "FlashForge Creator 5 Pro" and
+     "Testprinter" - so the brand path alone does not identify a FlashForge.
+   - Orca does not tell plugins which physical printer is connected
+     (`selected_printer()` has no serial or address). The plugin ties the
+     active printer preset (`preset_bundle().current_printer_preset()`) to an
+     account printer via config `printers` {Orca preset name: printer id};
+     without an entry it takes the one printer with slot data whose brand or
+     `printerName` matches `printer_model`, and saves that choice.
+   - A user's saved copy of a TigerTag preset (the only user preset whose
+     `filament_notes` carries that chip UID) is loaded instead of the bundle
+     preset; a bundle preset is passed by its internal name `_local/tigertag/<name>`.
+   - Orca stores the plugin config per capability name and plugin version
+     (`orca_plugins/config.json`); renaming the capability or bumping the
+     version may lose the saved e-mail. Not tested.
 2. **An inventory tab in Orca.** The spools with what is left on them; a warning
    when the sliced job needs more filament than the chosen spool holds.
 3. **Later, deliberately not first: subtract what a print used** from the
