@@ -18,6 +18,11 @@ nozzle range and density in the filament tab.
   preset's dirty options and re-applies them after the reload. It fails only
   if the edited preset disappears or is renamed, if a preset outside the
   bundle inherits from one inside, or if a dirty option would change.
+- Reinstalling a plugin empties its folder in `orca_plugins/` (seen
+  2026-11-14: `.session.json` and the database cache were gone, the config in
+  `orca_plugins/config.json` stayed). Session and cache therefore live in
+  `<data_dir>/tigertag_plugin/`. A file meant to survive must not sit in the
+  plugin folder.
 - An `ExecutionResult` message reaches only Orca's log
   (`log/debug_*.log`, "Script plugin execution completed"), not the user;
   the plugin therefore also calls `orca.host.ui.push_notification`.
@@ -59,6 +64,14 @@ nozzle range and density in the filament tab.
    - A user's saved copy of a TigerTag preset (the only user preset whose
      `filament_notes` carries that chip UID) is loaded instead of the bundle
      preset; a bundle preset is passed by its internal name `_local/tigertag/<name>`.
+   - Tested in Orca 2026-11-14 with `test_slots.json`: slots 1, 2, 4 got
+     their presets, the null slot 3 was left alone. The slot colour (the
+     coloured slot number) is the project's `filament_colour`; selecting a
+     preset does not change it, Orca's AMS sync does (owner confirmed).
+   - Test without printer or TigerSpool: `test_slots.json` in the installed
+     plugin folder (shape: `tools/test_slots.example.json`) replaces the
+     Firestore slots. The account's "Testprinter" (`klipper`) is the
+     TigerSpool mock printer; it needs a manual `printers` entry.
    - Orca stores the plugin config per capability name and plugin version
      (`orca_plugins/config.json`); renaming the capability or bumping the
      version may lose the saved e-mail. Not tested.

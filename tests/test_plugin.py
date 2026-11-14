@@ -272,6 +272,18 @@ class SlotTest(unittest.TestCase):
         with self.assertRaises(plugin.TigerTagError):
             plugin.printer_mapping({"printers": "{nope"})
 
+    def test_test_slots_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, plugin.TEST_SLOTS_FILE)
+            self.assertIsNone(plugin.load_test_slots(path))
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"p1": {"1": {"uid": "AA01"}, "2": None}}, handle)
+            self.assertEqual(plugin.load_test_slots(path), {"p1": {"1": {"uid": "AA01"}, "2": None}})
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("[1]")
+            with self.assertRaises(plugin.TigerTagError):
+                plugin.load_test_slots(path)
+
     def test_plan(self):
         entry = lambda uid: {"uid": uid, "material": "PLA", "color": "#5A6D30", "set_at": 1}
         slot_map = {"2": entry("bb01"), "1": entry("AA01"), "3": None, "4": entry("ZZ99"), "10": entry("AA01")}

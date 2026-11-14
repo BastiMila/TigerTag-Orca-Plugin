@@ -59,7 +59,11 @@ NETWORK_HOSTS = [
 ]
 
 BUNDLE_ID = "tigertag"
+STATE_FOLDER = "tigertag_plugin"  # below data_dir(); survives a reinstall of the plugin
 SESSION_FILE = ".session.json"
+# A slot map in this file (plugin folder) replaces what the TigerSpools published:
+# for testing slot loading without a printer or a TigerSpool.
+TEST_SLOTS_FILE = "test_slots.json"
 DB_CACHE_FILE = "tigertag_db_cache.json"
 DB_TABLES = ("id_brand", "id_material", "id_diameter", "id_aspect")
 FILAMENT_TYPE_ID = 142
@@ -618,6 +622,20 @@ def fetch_slot_maps(uid, id_token):
     return merge_slot_maps(boxes)
 
 
+def load_test_slots(path):
+    """The slot map in the test file, {printer id: {slot key: entry or null}}, or None without one."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            slot_maps = json.load(handle)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as error:
+        raise TigerTagError(f"{TEST_SLOTS_FILE} cannot be read: {error}") from None
+    if not isinstance(slot_maps, dict):
+        raise TigerTagError(f"{TEST_SLOTS_FILE} must hold {{printer id: {{slot: {{\"uid\": ...}}}}}}.")
+    return merge_slot_maps([(TEST_SLOTS_FILE, {"slots": slot_maps})])
+
+
 def fetch_printer_names(uid, id_token):
     """Account printer id -> (brand, printer name). Only the name is fetched, never a credential."""
     printers = {}
@@ -694,6 +712,16 @@ def find_data_dir():
         path = parent
 
 
+def state_dir():
+    """<data_dir>/tigertag_plugin: session and database cache.
+
+    Not the plugin folder, which OrcaSlicer empties when the plugin is reinstalled.
+    """
+    path = os.path.join(find_data_dir(), STATE_FOLDER)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 def find_preset_folder(bundle, data_dir):
     """The active user's preset folder name, taken from the path of any user preset."""
     user_root = os.path.normcase(os.path.abspath(os.path.join(data_dir, "user")))
@@ -740,12 +768,12 @@ def authenticate(config, session_path):
 def sync(capability):
     """The whole sync inside Orca: presets, then filament slots. Returns the message for the user."""
     config = json.loads(capability.get_config() or "{}")
-    session, changed_config = authenticate(config, os.path.join(plugin_dir(), SESSION_FILE))
+    session, changed_config = authenticate(config, os.path.join(state_dir(), SESSION_FILE))
     if changed_config is not None:
         capability.save_config(json.dumps(changed_config))
         config = changed_config
 
-    db = load_database(os.path.join(plugin_dir(), DB_CACHE_FILE))
+    db = load_database(os.path.join(state_dir(), DB_CACHE_FILE))
     spools = spools_from_documents(fetch_inventory(session["uid"], session["id_token"]), db)
 
     bundle = orca.host.preset_bundle()
@@ -792,10 +820,13 @@ def printer_mapping(config):
 
 def assign_slots(capability, config, session, spools, built):
     """Load the spool TigerSpool put into each slot of the active printer. Returns a message or ""."""
-    slot_maps = fetch_slot_maps(session["uid"], session["id_token"])
+    slot_maps = load_test_slots(os.path.join(plugin_dir(), TEST_SLOTS_FILE))
+    source = f" (from {TEST_SLOTS_FILE})" if slot_maps is not None else ""
+    if slot_maps is None:
+        slot_maps = fetch_slot_maps(session["uid"], session["id_token"])
     candidates = sorted(printer_id for printer_id, slots in slot_maps.items() if any(slots.values()))
     if not candidates:
-        return ""  # no TigerSpool has published a loaded slot
+        return f"Slots{source}: no slot holds a spool." if source else ""
 
     bundle = orca.host.preset_bundle()
     printer = bundle.current_printer_preset()
@@ -842,7 +873,7 @@ def assign_slots(capability, config, session, spools, built):
         loaded.append(f"{slot} {display_name(target)}")
 
     label = printer_names().get(printer_id, (None, printer_id))[1] if how == "matched" else printer.name
-    message = f"Slots of {label}: " + (", ".join(loaded) if loaded else "none loaded")
+    message = f"Slots of {label}{source}: " + (", ".join(loaded) if loaded else "none loaded")
     if notes:
         message += "; " + "; ".join(notes)
     return message + "."

@@ -24,7 +24,8 @@ The plugin only reads your account. It never changes it.
    Allow network access for the TigerTag and Google hosts when asked.
 2. In the plugin's Config tab, enter your TigerTag `email` and `password`.
    The password is used once. Afterwards the plugin keeps only a session
-   token, in `.session.json` in its plugin folder.
+   token, in `tigertag_plugin/.session.json` in OrcaSlicer's data folder, so
+   it survives a reinstall of the plugin.
 3. Run *TigerTag: sync filament presets*. Run it again whenever your spools change.
 
 The presets land in the local preset bundle `tigertag`, which each sync
@@ -42,5 +43,11 @@ If it cannot tell, it says so; then add `"<OrcaSlicer printer preset name>":
 
     python -m unittest discover -s tests -v
     python -I tools/dry_run.py LOCAL.md <out dir>   # sync against a real account, outside Orca
+
+To test slot loading without a printer or a TigerSpool, put a `test_slots.json`
+(shaped like `tools/test_slots.example.json`) into the plugin's folder in
+OrcaSlicer's `orca_plugins`. While it exists, the sync uses it instead of what
+the TigerSpools published. Map the selected OrcaSlicer printer to the printer
+id in the file under `printers` in the Config tab.
 
 Requires OrcaSlicer 2.5 or later, whose plugin system is still new.

@@ -1,0 +1,7 @@
+{
+    "<printer id from users/{uid}/printers/<brand>/devices>": {
+        "1": {"uid": "<chip UID of a spool>", "material": "PLA", "color": "#FFFFFF", "set_at": 1794577283000},
+        "2": {"uid": "<chip UID of another spool>"},
+        "3": null
+    }
+}
