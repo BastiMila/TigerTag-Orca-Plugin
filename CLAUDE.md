@@ -134,42 +134,58 @@ nozzle range and density in the filament tab.
      62 spools have one; rack names in `users/{uid}/racks/{id}.name` ("Regal",
      "Schrank Links", ...). Shown as Studio does: "Karton Sunlu 250G, B5".
 2b. **Load request, Orca -> TigerSpool.** Action "TigerTag: send slots to
-   TigerSpool" writes `users/{uid}/load_requests/{printerId}`; TigerSpool shows
-   at the printer which spool goes into which slot and where it is stored.
-   Written 2026-11-14; the action ran in Orca (HTTP 403, see below). The tab
-   shows the request it would send (`load_request_preview`, for the printer
-   chosen in the tab; slot keys of the last sync in
-   `<data_dir>/tigertag_plugin/slot_keys.json`) and sends it with its own
-   button on the job thread (written 2026-11-14, not run in Orca). Format
-   agreed with the TigerSpool session (2026-11-14):
-   `{source: "orcaslicer", requested_at: ms, job, slots: {<printer slot key>:
-   {uid, uids: [both chips], preset, material, color, grams_needed,
-   rack: {id, name, level, position} | null, place}}}`. Only slots holding a
-   TigerTag spool; after a slice only the slots the plate uses. The whole
-   document is replaced; the device never writes it, a request counts as done
-   when `slots` matches it, and is ignored after 24 h. `place` is English
-   display text for other readers - TigerSpool ignores it and builds its own
-   from `rack` (i18n, font coverage).
-   - TigerSpool reads it with one `documents:batchGet` over `printer_ids`,
-     every second heartbeat (only one TLS session fits in its RAM).
-   - Confirmed 2026-11-14 in Orca 2.5.1: the send action gets HTTP 403, and
-     Orca no longer crashes (with the tab changes below and 2.5.1 together,
-     so which of the two fixed it is unknown).
-   - Firestore has no wildcard rule under `users/{uid}`: until TigerTag adds
-     `match /users/{uid}/load_requests/{printerId}` (read, write if
-     auth.uid == uid), the write fails with 403 and the plugin says so. The
-     owner cannot deploy rules to `tigertag-connect` himself.
+   TigerSpool" and the tab's "Send to TigerSpool" button write the request;
+   TigerSpool shows at the printer which spool goes into which slot and where
+   it is stored. The tab shows the request before it is sent
+   (`load_request_preview`, for the printer chosen in the tab) and marks a slot
+   "loaded" when TigerSpool's `slots` holds one of its chips (as of the last
+   sync or send, kept in `<data_dir>/tigertag_plugin/slot_maps.json`).
+   Written 2026-11-14. Sent from the tab the same evening: both requests
+   (Testprinter, FlashForge) landed in the box document, intact; the device
+   did not show them yet (firmware side not confirmed on hardware).
+   - Where (TigerSpool session, 2026-11-14): not a collection of its own -
+     Firestore rules are per collection and `users/{uid}/load_requests` has
+     none (it gave HTTP 403; the owner cannot deploy rules to
+     `tigertag-connect`). Instead a field of each box document that already
+     allows the user: `users/{uid}/tigerspools/{mac}.load_requests.<printerId>`,
+     in every box whose `printer_ids` holds the printer. Written with one
+     `documents:commit`, `updateMask.fieldPaths = ["load_requests.<printerId>"]`
+     and `currentDocument.exists`, so a new request replaces only that
+     printer's entry. A printer id that is not `[A-Za-z_][A-Za-z_0-9]*` goes
+     in backticks - both of the owner's ids start with a digit, so both do.
+     The box's heartbeat never puts `load_requests` in its mask. This extends
+     the presence document: a prototype to settle with the TigerTag developers,
+     like the weight write-back.
+   - Format: `{source: "orcaslicer", requested_at: ms, job, slots: {<printer
+     slot key>: {uid, uids: [one or both chips], preset, material, color,
+     grams_needed, rack: {id, name, level, position} | null, place}}}`. Only
+     slots holding a TigerTag spool; after a slice only the slots the plate
+     uses. The device reads `uids` (else `uid`), `material`, `rack` and
+     `requested_at` (ignored after 24 h); not `color`, `job`, `grams_needed`,
+     `place`. It builds the place from `rack` itself (`<name>, B5`; only `B5`
+     if its font cannot draw the name).
+   - The device reads it with the first full heartbeat after boot, then every
+     second heartbeat (about a minute) while the screen is on. A slot is done
+     when `slots.<printerId>.<key>.uid` is one of `uids`; the device writes
+     nothing back. On the device: requested slots outlined orange, "load
+     marked slots (n)"; the scan screen shows the wanted material and place;
+     sending another spool still works and says it is not the one asked for.
+     Device side built on TigerSpool branch `afc-weight-writeback`, not yet
+     on hardware (2026-11-14).
    - `rack.level` and `rack.position` count from 0; Tiger Studio shows the
      level as a letter and the position from 1 (stored level 1, position 4 =
      "B5", confirmed by the owner on 2026-11-14). The plugin shows it the same
-     way; the TigerSpool firmware never reads `rack`.
+     way.
+   - Orca 2.5.1 no longer crashed after the tab changes (both came together,
+     so which of the two fixed it is unknown).
 3. **Later, deliberately not first: subtract what a print used** from the
    spool's `weight_available`. That field belongs to the TigerScale, and a
    second writer on it is an open question with TigerTag (the same question is
    open for TigerSpool, issue #31 in TigerTag-Project/TigerSpool-RFID). Do not
    build it until the owner says so.
 
-1 and 2 only read the account. The owner's decision: build first, then present
+1 and 2 only read the account; 2b writes only `load_requests` into the
+TigerSpool documents. The owner's decision: build first, then present
 it to the TigerTag developers - do not ask them beforehand.
 
 ## OrcaSlicer 2.5 plugins - what is documented

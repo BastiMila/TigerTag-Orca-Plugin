@@ -408,8 +408,31 @@ class LoadRequestTest(unittest.TestCase):
         self.assertIsNone(unsliced["slots"]["2"]["rack"])
         plugin.firestore_value(request)  # encodable
 
-        preview = plugin.load_request_preview(rows, False, "p1", ["0", "1", "2"])  # Happy Hare: gates from 0
+        held = {"0": {"uid": "aa02"}, "1": {"uid": "CC01"}, "2": None}  # Happy Hare: gates from 0
+        preview = plugin.load_request_preview(rows, False, "p1", held)
         self.assertEqual(preview["printer_id"], "p1")
-        self.assertEqual([slot["key"] for slot in preview["slots"]], ["0", "1"])
+        self.assertEqual([(s["key"], s["loaded"]) for s in preview["slots"]], [("0", True), ("1", False)])
         self.assertEqual(preview["slots"][0]["place"], slot["place"])
-        self.assertEqual(plugin.load_request_preview(rows, True, None, [])["slots"][0]["key"], "1")
+        self.assertEqual(plugin.load_request_preview(rows, True, None, {})["slots"][0]["key"], "1")
+
+    def test_request_goes_into_every_box_that_knows_the_printer(self):
+        request = {"source": "orcaslicer", "slots": {"1": {"uid": "AA01"}}}
+        boxes = [("mac1", {"printer_ids": ["46UAA607urZDtk62YJgq", "x"]}),
+                 ("mac2", {"printer_ids": ["x"]}),
+                 ("mac3", {"printer_ids": ["46UAA607urZDtk62YJgq"]}),
+                 ("mac4", {})]
+        writes = plugin.load_request_writes("u1", boxes, "46UAA607urZDtk62YJgq", request)
+        self.assertEqual([w["update"]["name"].rsplit("/", 1)[1] for w in writes], ["mac1", "mac3"])
+        write = writes[0]
+        self.assertTrue(write["update"]["name"].endswith("/documents/users/u1/tigerspools/mac1"))
+        self.assertEqual(write["updateMask"], {"fieldPaths": ["load_requests.`46UAA607urZDtk62YJgq`"]})
+        self.assertEqual(write["currentDocument"], {"exists": True})
+        fields = write["update"]["fields"]["load_requests"]["mapValue"]["fields"]
+        self.assertEqual(plugin.firestore_plain(fields["46UAA607urZDtk62YJgq"]), request)
+        self.assertEqual(plugin.load_request_writes("u1", boxes, "nobody", request), [])
+
+    def test_field_path_segment(self):
+        self.assertEqual(plugin.field_path_segment("TigerData_1"), "TigerData_1")
+        self.assertEqual(plugin.field_path_segment("abc_1"), "abc_1")
+        self.assertEqual(plugin.field_path_segment("7mj1K6MF1ucLHeotUlF1"), "`7mj1K6MF1ucLHeotUlF1`")
+        self.assertEqual(plugin.field_path_segment("a`b\\c"), "`a\\`b\\\\c`")

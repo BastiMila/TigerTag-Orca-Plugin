@@ -69,7 +69,7 @@ INVENTORY_CACHE_FILE = "inventory.json"  # written by the sync, read by the Tige
 # A slot map in this file (plugin folder) replaces what the TigerSpools published:
 # for testing slot loading without a printer or a TigerSpool.
 TEST_SLOTS_FILE = "test_slots.json"
-SLOT_KEYS_FILE = "slot_keys.json"  # printer id -> its slot keys, from the last sync (0- or 1-based)
+SLOT_MAPS_FILE = "slot_maps.json"  # the TigerSpool slots of every printer, as of the last sync or send
 DB_CACHE_FILE = "tigertag_db_cache.json"
 DB_TABLES = ("id_brand", "id_material", "id_diameter", "id_aspect")
 FILAMENT_TYPE_ID = 142
@@ -194,11 +194,19 @@ def firestore_value(value):
     return {"stringValue": str(value)}
 
 
-def write_document(what, path, fields, id_token):
-    """Create or replace the document at path with exactly these fields."""
-    url = f"{FIRESTORE_URL}/{urllib.parse.quote(path)}"
-    body = {"fields": {key: firestore_value(value) for key, value in fields.items()}}
-    return http_json(what, url, body, token=id_token, method="PATCH")
+_SIMPLE_FIELD = re.compile(r"[A-Za-z_][A-Za-z_0-9]*")
+
+
+def field_path_segment(name):
+    """One segment of a Firestore field path: as is when simple, else quoted in backticks."""
+    if _SIMPLE_FIELD.fullmatch(name):
+        return name
+    return "`" + name.replace("\\", "\\\\").replace("`", "\\`") + "`"
+
+
+def commit_writes(what, writes, id_token):
+    """Apply Firestore writes ({update, updateMask, ...}) in one atomic commit."""
+    return http_json(what, f"{FIRESTORE_URL}:commit", {"writes": writes}, token=id_token)
 
 
 def fetch_documents(what, path, mask, id_token):
@@ -795,14 +803,35 @@ def build_load_request(rows, sliced, known_keys, now_ms, job):
     return {"source": "orcaslicer", "requested_at": now_ms, "job": job, "slots": slots}
 
 
-def load_request_preview(rows, sliced, printer_id, slot_keys):
-    """What the tab shows of the load request it would send: its slots in the printer's order."""
-    request = build_load_request(rows, sliced, slot_keys, 0, "")
-    return {
-        "printer_id": printer_id,
-        "slots": [dict(slot, key=key) for key, slot in
-                  sorted(request["slots"].items(), key=lambda item: (len(item[0]), item[0]))],
-    }
+def load_request_writes(uid, boxes, printer_id, request):
+    """Firestore writes that put request into field load_requests.<printerId> of every
+    TigerSpool whose printer_ids holds the printer (format agreed with TigerSpool,
+    2026-11-14). Only that one entry is replaced; the box's heartbeat never touches it."""
+    field = "load_requests." + field_path_segment(printer_id)
+    writes = []
+    for mac, fields in boxes:
+        if printer_id not in (fields.get("printer_ids") or []):
+            continue
+        writes.append({
+            "update": {
+                "name": f"projects/tigertag-connect/databases/(default)/documents/users/{uid}/tigerspools/{mac}",
+                "fields": {"load_requests": firestore_value({printer_id: request})},
+            },
+            "updateMask": {"fieldPaths": [field]},
+            "currentDocument": {"exists": True},
+        })
+    return writes
+
+
+def load_request_preview(rows, sliced, printer_id, slot_map):
+    """What the tab shows of the load request it would send: its slots in the printer's
+    order, each marked loaded when TigerSpool reports one of its chips in that slot."""
+    request = build_load_request(rows, sliced, list(slot_map), 0, "")
+    slots = []
+    for key, slot in sorted(request["slots"].items(), key=lambda item: (len(item[0]), item[0])):
+        held = slot_map.get(key)
+        slots.append(dict(slot, key=key, loaded=bool(held and str(held.get("uid", "")).upper() in slot["uids"])))
+    return {"printer_id": printer_id, "slots": slots}
 
 
 def slot_rows(slot_presets, uid_of_preset, spools, used):
@@ -1042,10 +1071,10 @@ def assign_slots(capability, config, session, spools, built, known_printers=None
         slot_maps = fetch_slot_maps(session["uid"], session["id_token"])
     candidates = sorted(printer_id for printer_id, slots in slot_maps.items() if any(slots.values()))
     try:
-        write_text(os.path.join(state_dir(), SLOT_KEYS_FILE),
-                   json.dumps({printer_id: sorted(slots) for printer_id, slots in slot_maps.items()}))
+        write_text(os.path.join(state_dir(), SLOT_MAPS_FILE),
+                   json.dumps(slot_maps))
     except OSError:
-        pass  # only the tab's preview of a Happy Hare request numbers its gates wrong
+        pass  # the tab's preview then misses what is loaded (and Happy Hare's gate numbers)
     if not candidates:
         return f"Slots{source}: no slot holds a spool." if source else ""
 
@@ -1113,6 +1142,8 @@ INVENTORY_PAGE = r"""<!doctype html>
   .slots { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 8px; }
   .card { border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; }
   .card.short { border-color: var(--warn); }
+  .card.loaded { border-color: var(--ok); }
+  .ok { color: var(--ok); font-weight: 600; }
   .card .top { display: flex; align-items: center; gap: 8px; font-weight: 600; }
   .warn { color: var(--warn); font-weight: 600; }
   .sw { width: 14px; height: 14px; border-radius: 3px; border: 1px solid var(--line); flex: none; display: inline-block; vertical-align: middle; }
@@ -1200,10 +1231,11 @@ INVENTORY_PAGE = r"""<!doctype html>
   }
 
   function requestCard(s) {
-    return '<div class="card"><div class="top"><span style="white-space:nowrap">Slot ' + esc(s.key) + '</span> ' + swatch(s.color) + ' ' + esc(s.preset) + '</div>' +
+    return '<div class="card' + (s.loaded ? ' loaded' : '') + '"><div class="top"><span style="white-space:nowrap">Slot ' + esc(s.key) + '</span> ' + swatch(s.color) + ' ' + esc(s.preset) + '</div>' +
       (s.grams_needed ? '<div>Needs ' + grams(s.grams_needed) + '</div>' : '') +
       '<div>' + (s.place ? 'Take it from ' + esc(s.place) : '<span class="muted">No place stored</span>') + '</div>' +
-      '<div class="muted">Chip ' + esc(s.uids.join(' + ')) + '</div></div>';
+      '<div class="muted">Chip ' + esc(s.uids.join(' + ')) + '</div>' +
+      (s.loaded ? '<div class="ok">Loaded (as of the last sync)</div>' : '') + '</div>';
   }
 
   function renderRequest() {
@@ -1373,13 +1405,13 @@ def inventory_state(used):
     rows = slot_rows(slots, uid_of_preset, spools, used)
     printer_id = load_printer_map().get(orca_printer) or None
     try:
-        with open(os.path.join(state_dir(), SLOT_KEYS_FILE), encoding="utf-8") as handle:
-            slot_keys = json.load(handle).get(printer_id, []) if printer_id else []
+        with open(os.path.join(state_dir(), SLOT_MAPS_FILE), encoding="utf-8") as handle:
+            slot_map = json.load(handle).get(printer_id) or {} if printer_id else {}
     except (OSError, ValueError, AttributeError):
-        slot_keys = []
+        slot_map = {}
     return {
         "synced_at": cache.get("synced_at"),
-        "request": load_request_preview(rows, used is not None, printer_id, slot_keys),
+        "request": load_request_preview(rows, used is not None, printer_id, slot_map),
         "printer": {"orca": orca_printer, "choice": load_printer_map().get(orca_printer),
                     "known": cache.get("printers", [])},
         "spools": spools,
@@ -1415,18 +1447,28 @@ def send_load_request(capability):
     state = inventory_state(last_slice(slot_presets))
     if not state["spools"]:
         raise TigerTagError("Run \"TigerTag: sync filament presets\" first; there is no inventory yet.")
-    known_keys = list(fetch_slot_maps(session["uid"], session["id_token"]).get(printer_id, {}))
-    request = build_load_request(state["slots"], state["sliced"], known_keys, int(time.time() * 1000),
-                                 time.strftime("%Y-%m-%d %H:%M"))
+    boxes = fetch_documents("Reading the TigerSpools", f"users/{session['uid']}/tigerspools",
+                            ["printer_ids", "slots"], session["id_token"])
+    slot_maps = merge_slot_maps(boxes)
+    try:
+        write_text(os.path.join(state_dir(), SLOT_MAPS_FILE), json.dumps(slot_maps))
+    except OSError:
+        pass
+    request = build_load_request(state["slots"], state["sliced"], list(slot_maps.get(printer_id, {})),
+                                 int(time.time() * 1000), time.strftime("%Y-%m-%d %H:%M"))
     if not request["slots"]:
         raise TigerTagError("No filament slot holds a TigerTag spool"
                             + (" that this plate uses." if state["sliced"] else "."))
-    write_document("Sending the load request", f"users/{session['uid']}/load_requests/{printer_id}",
-                   request, session["id_token"])
     label = names.get(printer_id, (None, printer_id))[1]
+    writes = load_request_writes(session["uid"], boxes, printer_id, request)
+    if not writes:
+        raise TigerTagError(f"No TigerSpool knows {label} yet: let a TigerSpool sync with the account, "
+                            "then send again.")
+    commit_writes("Sending the load request", writes, session["id_token"])
     parts = [f"{key} {slot['preset']}" + (f" ({slot['grams_needed']} g)" if slot["grams_needed"] else "")
              for key, slot in sorted(request["slots"].items(), key=lambda item: (len(item[0]), item[0]))]
-    return f"TigerTag: sent to {label}: " + ", ".join(parts) + "."
+    return (f"TigerTag: sent to {label} ({len(writes)} TigerSpool{'s' if len(writes) > 1 else ''}): "
+            + ", ".join(parts) + ".")
 
 
 class StoredSession:

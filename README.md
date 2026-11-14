@@ -45,14 +45,13 @@ If it cannot tell, it says so; then choose the printer in the TigerTag tab
 printers, choose once per OrcaSlicer printer preset; two printers of the same
 model need two printer presets in OrcaSlicer.
 
-*TigerTag: send slots to TigerSpool* (written, untested) does the opposite:
+*TigerTag: send slots to TigerSpool* does the opposite:
 it tells your TigerSpool which spool goes into which slot of the selected
 printer, and where each spool is stored. After a slice it asks only for the
-slots the plate uses. It writes one document per printer to your account
-(`load_requests`), and nothing else. The TigerTag account must allow this;
-until it does, the action reports that it was refused. The TigerTag tab shows
-the request before it is sent - slot, spool, grams needed, where to take it
-from - and has its own *Send to TigerSpool* button.
+slots the plate uses. It writes the request into the field `load_requests` of
+each TigerSpool in your account that knows the printer, and nothing else.
+The TigerTag tab shows the request before it is sent - slot, spool, grams
+needed, where to take it from - and has its own *Send to TigerSpool* button.
 
 ## Development
 
