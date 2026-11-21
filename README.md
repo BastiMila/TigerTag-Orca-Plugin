@@ -64,4 +64,16 @@ OrcaSlicer's `orca_plugins`. While it exists, the sync uses it instead of what
 the TigerSpools published. Map the selected OrcaSlicer printer to the printer
 id in the file under `printers` in the Config tab.
 
+### Presets-only edition
+
+    python tools/build_presets_edition.py   # writes dist/tigertag_presets.py
+
+builds *TigerTag Filament Presets*, a single file for publishing: only
+*TigerTag: sync filament presets*. It has no filament slots, no printers, no
+TigerTag tab and no load request, and it writes nothing to the account. The
+file is generated from `tigertag_orca_plugin.py`; code between
+`# region printer` and `# endregion printer` is left out, and code between
+`# region presets-only` and `# endregion presets-only` is uncommented.
+Keep these markers balanced when changing the plugin.
+
 Requires OrcaSlicer 2.5 or later, whose plugin system is still new.

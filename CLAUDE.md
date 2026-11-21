@@ -148,7 +148,10 @@ nozzle range and density in the filament tab.
      none (it gave HTTP 403; the owner cannot deploy rules to
      `tigertag-connect`). Instead a field of each box document that already
      allows the user: `users/{uid}/tigerspools/{mac}.load_requests.<printerId>`,
-     in every box whose `printer_ids` holds the printer. Written with one
+     in every box whose `printer_ids` holds the printer - or, since
+     `printer_ids` lives in the box's RAM and is empty after a reboot until
+     its first account sync (seen 2026-11-15), whose `slots` or
+     `load_requests` name it (`box_serves`). Written with one
      `documents:commit`, `updateMask.fieldPaths = ["load_requests.<printerId>"]`
      and `currentDocument.exists`, so a new request replaces only that
      printer's entry. A printer id that is not `[A-Za-z_][A-Za-z_0-9]*` goes
@@ -194,7 +197,16 @@ nozzle range and density in the filament tab.
    build it until the owner says so.
 
 1 and 2 only read the account; 2b writes only `load_requests` into the
-TigerSpool documents. The owner's decision: build first, then present
+TigerSpool documents.
+
+**Presets-only edition** (decided 2026-11-15: the owner wants to publish only
+stage 1 on Orca Cloud). `tools/build_presets_edition.py` generates
+`dist/tigertag_presets.py` ("TigerTag Filament Presets", own version in the
+script) from the one source: it drops `# region printer` blocks and uncomments
+`# region presets-only` blocks. Everything about slots, printers, the tab and
+TigerSpool goes inside a printer region. Tests build it and check that it
+holds no printer part and makes the same presets. Not yet run in Orca. It shares
+the bundle `tigertag` and `<data_dir>/tigertag_plugin/` with the full plugin. The owner's decision: build first, then present
 it to the TigerTag developers - do not ask them beforehand.
 
 ## OrcaSlicer 2.5 plugins - what is documented

@@ -303,10 +303,6 @@ class SlotTest(unittest.TestCase):
                                  "slot 10: the project has only 4 filament(s)"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class InventoryTest(unittest.TestCase):
     def test_rack_and_place(self):
         spool = plugin.spool_from_document("aa01", document(rack={"id": "r1", "level": 1, "position": 3}), DB)
@@ -430,6 +426,9 @@ class LoadRequestTest(unittest.TestCase):
         fields = write["update"]["fields"]["load_requests"]["mapValue"]["fields"]
         self.assertEqual(plugin.firestore_plain(fields["46UAA607urZDtk62YJgq"]), request)
         self.assertEqual(plugin.load_request_writes("u1", boxes, "nobody", request), [])
+        rebooted = [("mac5", {"printer_ids": [], "slots": {"46UAA607urZDtk62YJgq": {"1": None}}}),
+                    ("mac6", {"load_requests": {"46UAA607urZDtk62YJgq": {}}})]
+        self.assertEqual(len(plugin.load_request_writes("u1", rebooted, "46UAA607urZDtk62YJgq", request)), 2)
 
     def test_brand_and_chipless_slots(self):
         spools = plugin.spools_from_documents(
@@ -464,3 +463,57 @@ class LoadRequestTest(unittest.TestCase):
         self.assertEqual(plugin.field_path_segment("abc_1"), "abc_1")
         self.assertEqual(plugin.field_path_segment("7mj1K6MF1ucLHeotUlF1"), "`7mj1K6MF1ucLHeotUlF1`")
         self.assertEqual(plugin.field_path_segment("a`b\\c"), "`a\\`b\\\\c`")
+
+
+class PresetsEditionTest(unittest.TestCase):
+    """tools/build_presets_edition.py: the presets-only file for publishing."""
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        import build_presets_edition as edition
+        with open(os.path.join(ROOT, "tigertag_orca_plugin.py"), encoding="utf-8") as handle:
+            cls.text = edition.build(handle.read())
+        cls.folder = tempfile.TemporaryDirectory()
+        path = os.path.join(cls.folder.name, "tigertag_presets.py")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(cls.text)
+        spec = importlib.util.spec_from_file_location("tigertag_presets", path)
+        cls.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.module)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.folder.cleanup()
+
+    def test_header(self):
+        self.assertTrue(self.text.startswith("# /// script\n"))
+        self.assertIn('# name = "TigerTag Filament Presets"', self.text)
+
+    def test_nothing_of_the_printer_part(self):
+        for word in ("tigerspools", "load_requests", ":commit", "printers/", "threading", "fs_read",
+                     "begin_update", "region"):
+            self.assertNotIn(word, self.text)
+        for name in ("sync", "build_presets", "write_bundle", "authenticate"):
+            self.assertTrue(hasattr(self.module, name), name)
+        for name in ("assign_slots", "send_load_request", "INVENTORY_PAGE", "firestore_value"):
+            self.assertFalse(hasattr(self.module, name), name)
+
+    def test_same_presets_as_the_plugin(self):
+        spool = plugin.spool_from_document("5301E4BA000001", document(), DB)
+        expected = plugin.build_presets([spool], system_names(), lambda base, key: None, "2026-11-15")
+        spool = self.module.spool_from_document("5301E4BA000001", document(), DB)
+        self.assertEqual(self.module.build_presets([spool], system_names(), lambda base, key: None, "2026-11-15"),
+                         expected)
+
+    def test_unbalanced_regions_are_refused(self):
+        import build_presets_edition as edition
+        with self.assertRaises(ValueError):
+            edition.build("import os\n# region printer\nx = 1\n")
+        with self.assertRaises(ValueError):
+            edition.build("import os\n# endregion printer\n")
+
+
+if __name__ == "__main__":
+    unittest.main()

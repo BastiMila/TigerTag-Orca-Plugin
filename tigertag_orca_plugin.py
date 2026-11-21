@@ -31,13 +31,15 @@ only write: which spool goes into which slot. Spools and weights are never writt
 The module also imports without Orca (orca = None), so the pure functions can be
 tested and tools/dry_run.py can run a sync outside the slicer.
 """
-import glob
 import json
-import threading
 import os
 import re
 import time
+# region printer
+import glob
+import threading
 import traceback
+# endregion printer
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -65,6 +67,8 @@ NETWORK_HOSTS = [
 BUNDLE_ID = "tigertag"
 STATE_FOLDER = "tigertag_plugin"  # below data_dir(); survives a reinstall of the plugin
 SESSION_FILE = ".session.json"
+DB_CACHE_FILE = "tigertag_db_cache.json"
+# region printer
 PRINTER_MAP_FILE = "printers.json"  # Orca printer preset -> account printer id, shared by all actions
 INVENTORY_CACHE_FILE = "inventory.json"  # written by the sync, read by the TigerTag tab
 # A slot map in this file (plugin folder) replaces what the TigerSpools published:
@@ -73,7 +77,12 @@ TEST_SLOTS_FILE = "test_slots.json"
 CONFIRMED_FILE = "confirmed.json"  # printer id -> {slot key: uid} the user confirmed as loaded
 LAST_ERROR_FILE = "last_error.txt"  # the last failed job of the tab, with its traceback
 SLOT_MAPS_FILE = "slot_maps.json"  # the TigerSpool slots of every printer, as of the last sync or send
-DB_CACHE_FILE = "tigertag_db_cache.json"
+# Brands under users/{uid}/printers/{brand}/devices, as TigerSpool reads them.
+# Printer documents hold credentials: only the name is ever fetched.
+PRINTER_BRANDS = ("creality", "flashforge", "bambulab", "snapmaker", "elegoo", "anycubic", "klipper")
+NOTE_UID = re.compile(r"TigerTag spool ([0-9A-Za-z_]+)")
+LOCAL_PREFIX = "_local/" + BUNDLE_ID + "/"  # internal name of a bundle preset
+# endregion printer
 DB_TABLES = ("id_brand", "id_material", "id_diameter", "id_aspect")
 FILAMENT_TYPE_ID = 142
 PRESET_VERSION = "2.5.0.0"
@@ -90,12 +99,6 @@ INVENTORY_MASK = [
 
 NOZZLE_TEMP_KEYS = ("nozzle_temperature", "nozzle_temperature_initial_layer")
 # Per build plate. A value of 0 means "this plate is not supported" and is kept.
-# Brands under users/{uid}/printers/{brand}/devices, as TigerSpool reads them.
-# Printer documents hold credentials: only the name is ever fetched.
-PRINTER_BRANDS = ("creality", "flashforge", "bambulab", "snapmaker", "elegoo", "anycubic", "klipper")
-NOTE_UID = re.compile(r"TigerTag spool ([0-9A-Za-z_]+)")
-LOCAL_PREFIX = "_local/" + BUNDLE_ID + "/"  # internal name of a bundle preset
-
 BED_TEMP_KEYS = tuple(
     plate + suffix
     for plate in ("cool_plate_temp", "textured_cool_plate_temp", "eng_plate_temp",
@@ -180,6 +183,7 @@ def firestore_plain(value):
     return inner
 
 
+# region printer
 def firestore_value(value):
     """Plain Python -> a Firestore REST typed value."""
     if value is None:
@@ -210,6 +214,7 @@ def field_path_segment(name):
 def commit_writes(what, writes, id_token):
     """Apply Firestore writes ({update, updateMask, ...}) in one atomic commit."""
     return http_json(what, f"{FIRESTORE_URL}:commit", {"writes": writes}, token=id_token)
+# endregion printer
 
 
 def fetch_documents(what, path, mask, id_token):
@@ -525,6 +530,7 @@ def build_presets(spools, available_names, base_value_of, synced_at):
     return presets, skipped
 
 
+# region printer
 # --------------------------------------------------------------------------- filament slots
 
 def merge_slot_maps(boxes):
@@ -822,6 +828,18 @@ def build_load_request(rows, sliced, known_keys, now_ms, job, confirmed=None):
     return {"source": "orcaslicer", "requested_at": now_ms, "job": job, "slots": slots}
 
 
+def box_serves(fields, printer_id):
+    """True when a TigerSpool document belongs to a box in front of printer_id.
+
+    printer_ids is held in the box's RAM only: after a reboot it is empty until the
+    box's first account sync (seen 2026-11-15). The slots it published and a request
+    already sent to it name the printer too.
+    """
+    return (printer_id in (fields.get("printer_ids") or [])
+            or printer_id in (fields.get("slots") or {})
+            or printer_id in (fields.get("load_requests") or {}))
+
+
 def load_request_writes(uid, boxes, printer_id, request):
     """Firestore writes that put request into field load_requests.<printerId> of every
     TigerSpool whose printer_ids holds the printer (format agreed with TigerSpool,
@@ -829,7 +847,7 @@ def load_request_writes(uid, boxes, printer_id, request):
     field = "load_requests." + field_path_segment(printer_id)
     writes = []
     for mac, fields in boxes:
-        if printer_id not in (fields.get("printer_ids") or []):
+        if not box_serves(fields, printer_id):
             continue
         writes.append({
             "update": {
@@ -851,7 +869,7 @@ def slot_removal_writes(uid, boxes, printer_id, key):
                    "fields": {}},
         "updateMask": {"fieldPaths": [field]},
         "currentDocument": {"exists": True},
-    } for mac, fields in boxes if printer_id in (fields.get("printer_ids") or [])]
+    } for mac, fields in boxes if box_serves(fields, printer_id)]
 
 
 def load_request_preview(rows, sliced, printer_id, slot_map, confirmed=None):
@@ -892,6 +910,9 @@ def slot_rows(slot_presets, uid_of_preset, spools, used):
             "short": bool(needed and remaining is not None and needed > remaining),
         })
     return rows
+
+
+# endregion printer
 
 
 # --------------------------------------------------------------------------- bundle on disk
@@ -1010,7 +1031,12 @@ def authenticate(config, session_path):
 
 
 def sync(capability):
+    # region printer
     """The whole sync inside Orca: presets, then filament slots. Returns the message for the user."""
+    # endregion printer
+    # region presets-only
+    # """The whole sync inside Orca: the filament presets. Returns the message for the user."""
+    # endregion presets-only
     config = json.loads(capability.get_config() or "{}")
     session, changed_config = authenticate(config, os.path.join(state_dir(), SESSION_FILE))
     if changed_config is not None:
@@ -1039,6 +1065,10 @@ def sync(capability):
                             "but OrcaSlicer does not list the bundle there.")
     orca.host.preset.bundles.reload_local(BUNDLE_ID)
 
+    message = f"TigerTag: {len(presets)} filament preset(s) from {len(spools)} spool(s)."
+    if skipped:
+        message += " Skipped: " + "; ".join(skipped) + "."
+    # region printer
     try:
         rack_names = fetch_rack_names(session["uid"], session["id_token"])
     except TigerTagError:
@@ -1047,19 +1077,17 @@ def sync(capability):
     write_text(os.path.join(state_dir(), INVENTORY_CACHE_FILE),
                json.dumps(inventory_cache(spools, preset_names(spools), set(presets), rack_names, int(time.time()),
                                           printers)))
-
-    message = f"TigerTag: {len(presets)} filament preset(s) from {len(spools)} spool(s)."
-    if skipped:
-        message += " Skipped: " + "; ".join(skipped) + "."
     try:
         slots = assign_slots(capability, config, session, spools, set(presets), printers)
     except TigerTagError as error:  # the presets are in place; only the slots failed
         slots = f"Slots: {error}"
     if slots:
         message += " " + slots
+    # endregion printer
     return message
 
 
+# region printer
 def load_printer_map():
     try:
         with open(os.path.join(state_dir(), PRINTER_MAP_FILE), encoding="utf-8") as handle:
@@ -1508,7 +1536,7 @@ def confirm_slot(printer_id, key, spool_uid):
     printer's load request in every TigerSpool, and leave it out of later sends."""
     session = stored_session()
     boxes = fetch_documents("Reading the TigerSpools", f"users/{session['uid']}/tigerspools",
-                            ["printer_ids"], session["id_token"])
+                            ["printer_ids", "slots", "load_requests"], session["id_token"])
     writes = slot_removal_writes(session["uid"], boxes, printer_id, key)
     if writes:
         commit_writes("Updating the load request", writes, session["id_token"])
@@ -1539,7 +1567,7 @@ def send_load_request(capability):
     if not state["spools"]:
         raise TigerTagError("Run \"TigerTag: sync filament presets\" first; there is no inventory yet.")
     boxes = fetch_documents("Reading the TigerSpools", f"users/{session['uid']}/tigerspools",
-                            ["printer_ids", "slots"], session["id_token"])
+                            ["printer_ids", "slots", "load_requests"], session["id_token"])
     slot_maps = merge_slot_maps(boxes)
     try:
         write_text(os.path.join(state_dir(), SLOT_MAPS_FILE), json.dumps(slot_maps))
@@ -1579,6 +1607,7 @@ class StoredSession:
 
     def save_config(self, _text):
         pass  # never called: there is no password to clear
+# endregion printer
 
 
 def notify(text, error=False):
@@ -1600,7 +1629,12 @@ if orca is not None:
             return "TigerTag: sync filament presets"
 
         def get_default_config(self):
+            # region printer
             return {"email": "", "password": "", "printers": {}}
+            # endregion printer
+            # region presets-only
+            # return {"email": "", "password": ""}
+            # endregion presets-only
 
         def execute(self):
             try:
@@ -1615,6 +1649,7 @@ if orca is not None:
             notify(message, error=True)
             return orca.ExecutionResult.failure(orca.PluginResult.RecoverableError, message)
 
+    # region printer
     class TigerTagSend(orca.script.ScriptPluginCapabilityBase):
         def get_name(self):
             return "TigerTag: send slots to TigerSpool"
@@ -1713,15 +1748,21 @@ if orca is not None:
             # The page is only told to ask again; its request arrives later, when Orca is idle.
             if event == orca.LifecycleEvent.SlicingJobComplete:
                 self.post_message({"command": "changed"})
+    # endregion printer
 
     @orca.plugin
     class TigerTagPlugin(orca.base):
         def register_capabilities(self):
+            # region printer
             # One grant for the whole slice folder, asked once at load: the tab reads
             # the G-code of each slice there. Without it every folder read prompts.
             folder = slice_folder()
             orca.request_permissions(network=NETWORK_HOSTS, fs_read=[os.path.join(folder, "*")] if folder else [],
                                      threading=True)  # the tab's sync button runs on its own thread
-            orca.register_capability(TigerTagSync)
             orca.register_capability(TigerTagSend)
             orca.register_capability(TigerTagInventory)
+            # endregion printer
+            # region presets-only
+            # orca.request_permissions(network=NETWORK_HOSTS)
+            # endregion presets-only
+            orca.register_capability(TigerTagSync)
