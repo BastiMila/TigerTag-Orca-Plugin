@@ -431,6 +431,34 @@ class LoadRequestTest(unittest.TestCase):
         self.assertEqual(plugin.firestore_plain(fields["46UAA607urZDtk62YJgq"]), request)
         self.assertEqual(plugin.load_request_writes("u1", boxes, "nobody", request), [])
 
+    def test_brand_and_chipless_slots(self):
+        spools = plugin.spools_from_documents(
+            [("aa01", document()), ("TigerData_17945028572291253", document(name="Black"))], DB)
+        names = plugin.preset_names(spools)
+        cached = plugin.inventory_cache(spools, names, set(names.values()), {}, 5)["spools"]
+        uid_of = {"A": "AA01", "B": "TIGERDATA_17945028572291253"}.get
+        rows = plugin.slot_rows(["A", "B"], uid_of, cached, None)
+        request = plugin.build_load_request(rows, False, [], 1, "job")
+        self.assertEqual(request["slots"]["1"]["brand"], "Sunlu")
+        self.assertTrue(plugin.has_chip("AA01"))
+        self.assertFalse(plugin.has_chip("TIGERDATA_17945028572291253"))
+
+        confirmed = {"2": "TIGERDATA_17945028572291253"}
+        self.assertEqual(sorted(plugin.build_load_request(rows, False, [], 1, "job", confirmed)["slots"]), ["1"])
+        moved = {"1": "TIGERDATA_17945028572291253"}  # confirmed in another slot: still asked for
+        self.assertEqual(sorted(plugin.build_load_request(rows, False, [], 1, "job", moved)["slots"]), ["1", "2"])
+
+        preview = plugin.load_request_preview(rows, False, "p1", {}, confirmed)["slots"]
+        self.assertEqual([(s["key"], s["chip"], s["confirmed"]) for s in preview],
+                         [("1", True, False), ("2", False, True)])
+
+    def test_slot_removal_writes(self):
+        boxes = [("mac1", {"printer_ids": ["7mj1K6MF1ucLHeotUlF1"]}), ("mac2", {"printer_ids": []})]
+        writes = plugin.slot_removal_writes("u1", boxes, "7mj1K6MF1ucLHeotUlF1", "3")
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(writes[0]["update"]["fields"], {})  # masked and missing = deleted
+        self.assertEqual(writes[0]["updateMask"]["fieldPaths"], ["load_requests.`7mj1K6MF1ucLHeotUlF1`.slots.`3`"])
+
     def test_field_path_segment(self):
         self.assertEqual(plugin.field_path_segment("TigerData_1"), "TigerData_1")
         self.assertEqual(plugin.field_path_segment("abc_1"), "abc_1")

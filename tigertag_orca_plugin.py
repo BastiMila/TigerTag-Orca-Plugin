@@ -37,6 +37,7 @@ import threading
 import os
 import re
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -69,6 +70,8 @@ INVENTORY_CACHE_FILE = "inventory.json"  # written by the sync, read by the Tige
 # A slot map in this file (plugin folder) replaces what the TigerSpools published:
 # for testing slot loading without a printer or a TigerSpool.
 TEST_SLOTS_FILE = "test_slots.json"
+CONFIRMED_FILE = "confirmed.json"  # printer id -> {slot key: uid} the user confirmed as loaded
+LAST_ERROR_FILE = "last_error.txt"  # the last failed job of the tab, with its traceback
 SLOT_MAPS_FILE = "slot_maps.json"  # the TigerSpool slots of every printer, as of the last sync or send
 DB_CACHE_FILE = "tigertag_db_cache.json"
 DB_TABLES = ("id_brand", "id_material", "id_diameter", "id_aspect")
@@ -777,22 +780,38 @@ def printer_slot_key(orca_slot, known_keys):
     return str(orca_slot - 1 if zero_based else orca_slot)
 
 
-def build_load_request(rows, sliced, known_keys, now_ms, job):
-    """The document for users/{uid}/load_requests/{printerId}: which spool goes into which slot.
+_CHIP_UID = re.compile(r"[0-9A-F]+")
 
-    Format agreed with TigerSpool (2026-11-14). Only slots holding a TigerTag spool
-    are asked for; after a slice, only the slots the plate uses.
+
+def has_chip(uid):
+    """False for a spool without a TigerTag chip (inventory id TigerData_<n>): TigerSpool can
+    never see it in a slot, so only the user can say it is loaded."""
+    return bool(_CHIP_UID.fullmatch(uid or ""))
+
+
+def build_load_request(rows, sliced, known_keys, now_ms, job, confirmed=None):
+    """A load request: which spool goes into which slot (field load_requests.<printerId>).
+
+    Format agreed with TigerSpool (2026-11-14/15). Only slots holding a TigerTag spool
+    are asked for; after a slice, only the slots the plate uses. confirmed ({slot key:
+    uid}) holds slots the user said are loaded; they are left out while the same spool
+    is asked for.
     """
+    confirmed = confirmed or {}
     slots = {}
     for row in rows:
         spool = row["spool"]
         if spool is None or (sliced and not row["needed_g"]):
             continue
+        key = printer_slot_key(row["slot"], known_keys)
+        if confirmed.get(key) == spool["uid"]:
+            continue
         rack = spool.get("rack")
-        slots[printer_slot_key(row["slot"], known_keys)] = {
+        slots[key] = {
             "uid": spool["uid"],
             "uids": [uid for uid in (spool["uid"], spool.get("twin_uid")) if uid],
             "preset": row["preset"],
+            "brand": spool.get("brand") or "",
             "material": spool.get("material") or "",
             "color": spool.get("colour") or "",
             "grams_needed": round(row["needed_g"], 1) if row["needed_g"] is not None else None,
@@ -823,14 +842,29 @@ def load_request_writes(uid, boxes, printer_id, request):
     return writes
 
 
-def load_request_preview(rows, sliced, printer_id, slot_map):
+def slot_removal_writes(uid, boxes, printer_id, key):
+    """Firestore writes that delete slot key from the load request of printer_id in every
+    TigerSpool that knows the printer (a masked field missing from `fields` is deleted)."""
+    field = f"load_requests.{field_path_segment(printer_id)}.slots.{field_path_segment(key)}"
+    return [{
+        "update": {"name": f"projects/tigertag-connect/databases/(default)/documents/users/{uid}/tigerspools/{mac}",
+                   "fields": {}},
+        "updateMask": {"fieldPaths": [field]},
+        "currentDocument": {"exists": True},
+    } for mac, fields in boxes if printer_id in (fields.get("printer_ids") or [])]
+
+
+def load_request_preview(rows, sliced, printer_id, slot_map, confirmed=None):
     """What the tab shows of the load request it would send: its slots in the printer's
     order, each marked loaded when TigerSpool reports one of its chips in that slot."""
+    confirmed = confirmed or {}
     request = build_load_request(rows, sliced, list(slot_map), 0, "")
     slots = []
     for key, slot in sorted(request["slots"].items(), key=lambda item: (len(item[0]), item[0])):
         held = slot_map.get(key)
-        slots.append(dict(slot, key=key, loaded=bool(held and str(held.get("uid", "")).upper() in slot["uids"])))
+        slots.append(dict(slot, key=key, chip=has_chip(slot["uid"]),
+                          confirmed=confirmed.get(key) == slot["uid"],
+                          loaded=bool(held and str(held.get("uid", "")).upper() in slot["uids"])))
     return {"printer_id": printer_id, "slots": slots}
 
 
@@ -1052,6 +1086,28 @@ def remember_printer(orca_printer, printer_id):
     write_text(os.path.join(state_dir(), PRINTER_MAP_FILE), json.dumps(stored, indent=2, ensure_ascii=False))
 
 
+def load_confirmed(printer_id):
+    try:
+        with open(os.path.join(state_dir(), CONFIRMED_FILE), encoding="utf-8") as handle:
+            stored = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    entry = stored.get(printer_id) if isinstance(stored, dict) else None
+    return entry if isinstance(entry, dict) else {}
+
+
+def remember_confirmed(printer_id, key, spool_uid):
+    try:
+        with open(os.path.join(state_dir(), CONFIRMED_FILE), encoding="utf-8") as handle:
+            stored = json.load(handle)
+    except (OSError, ValueError):
+        stored = {}
+    if not isinstance(stored, dict):
+        stored = {}
+    stored.setdefault(printer_id, {})[key] = spool_uid
+    write_text(os.path.join(state_dir(), CONFIRMED_FILE), json.dumps(stored, indent=2))
+
+
 def printer_mapping(config):
     """The config's "printers" as a dict; the Config tab may hand it back as JSON text."""
     mapping = config.get("printers")
@@ -1163,6 +1219,7 @@ INVENTORY_PAGE = r"""<!doctype html>
   <button type="button" id="refresh">Refresh</button>
 </header>
 <div id="status" class="muted"></div>
+<div id="joberror" class="warn"></div>
 <div id="error" class="warn"></div>
 <h3>Filament slots</h3>
 <div class="printer">
@@ -1231,11 +1288,16 @@ INVENTORY_PAGE = r"""<!doctype html>
   }
 
   function requestCard(s) {
-    return '<div class="card' + (s.loaded ? ' loaded' : '') + '"><div class="top"><span style="white-space:nowrap">Slot ' + esc(s.key) + '</span> ' + swatch(s.color) + ' ' + esc(s.preset) + '</div>' +
+    return '<div class="card' + (s.loaded || s.confirmed ? ' loaded' : '') + '"><div class="top"><span style="white-space:nowrap">Slot ' + esc(s.key) + '</span> ' + swatch(s.color) + ' ' + esc(s.preset) + '</div>' +
       (s.grams_needed ? '<div>Needs ' + grams(s.grams_needed) + '</div>' : '') +
       '<div>' + (s.place ? 'Take it from ' + esc(s.place) : '<span class="muted">No place stored</span>') + '</div>' +
       '<div class="muted">Chip ' + esc(s.uids.join(' + ')) + '</div>' +
-      (s.loaded ? '<div class="ok">Loaded (as of the last sync)</div>' : '') + '</div>';
+      (s.loaded ? '<div class="ok">Loaded (as of the last sync)</div>' : '') +
+      (s.confirmed ? '<div class="ok">Confirmed as loaded - not asked for</div>' : '') +
+      (!s.chip && !s.confirmed && !s.loaded
+        ? '<div class="muted">No TigerTag chip: TigerSpool cannot see it in the slot.</div>' +
+          '<button type="button" data-key="' + esc(s.key) + '" data-uid="' + esc(s.uid) + '">Loaded - remove from request</button>'
+        : '') + '</div>';
   }
 
   function renderRequest() {
@@ -1284,13 +1346,16 @@ INVENTORY_PAGE = r"""<!doctype html>
     if (msg.command === 'busy') {
       busy = true;
       document.getElementById('sync').disabled = document.getElementById('send').disabled = true;
+      document.querySelectorAll('#request button').forEach(b => b.disabled = true);
       document.getElementById('status').textContent = msg.text;
+      document.getElementById('joberror').textContent = '';
     }
     if (msg.command === 'done') {
       busy = false;
       document.getElementById('sync').disabled = false;
       document.getElementById('status').textContent = msg.ok ? msg.text : '';
-      document.getElementById('error').textContent = msg.ok ? '' : msg.text;
+      // Kept until the next job: the refresh below clears only #error.
+      document.getElementById('joberror').textContent = msg.ok ? '' : msg.text;
       refresh();
     }
   });
@@ -1301,6 +1366,12 @@ INVENTORY_PAGE = r"""<!doctype html>
   document.getElementById('refresh').onclick = refresh;
   document.getElementById('sync').onclick = () => window.orca.postMessage({command: 'sync'});
   document.getElementById('send').onclick = () => window.orca.postMessage({command: 'send'});
+  document.getElementById('request').onclick = e => {
+    const b = e.target.closest('button[data-key]');
+    if (!b || busy || !state.request.printer_id) return;
+    window.orca.postMessage({command: 'confirm', printer_id: state.request.printer_id,
+                             key: b.dataset.key, uid: b.dataset.uid});
+  };
   document.getElementById('filter').oninput = render;
   document.getElementById('printer').onchange = e => {
     const v = e.target.value;
@@ -1411,7 +1482,8 @@ def inventory_state(used):
         slot_map = {}
     return {
         "synced_at": cache.get("synced_at"),
-        "request": load_request_preview(rows, used is not None, printer_id, slot_map),
+        "request": load_request_preview(rows, used is not None, printer_id, slot_map,
+                                        load_confirmed(printer_id) if printer_id else {}),
         "printer": {"orca": orca_printer, "choice": load_printer_map().get(orca_printer),
                     "known": cache.get("printers", [])},
         "spools": spools,
@@ -1420,14 +1492,33 @@ def inventory_state(used):
     }
 
 
-def send_load_request(capability):
-    """Write the active printer's slots as a load request for TigerSpool. Returns the message."""
+def stored_session():
+    """A fresh id token from the session the sync stored; never asks for a password."""
     stored = load_session(os.path.join(state_dir(), SESSION_FILE))
     if not stored.get("refresh_token"):
         raise TigerTagError("Run \"TigerTag: sync filament presets\" once first; it signs in.")
     session = refresh_session(stored["refresh_token"])
     write_text(os.path.join(state_dir(), SESSION_FILE),
                json.dumps(dict(stored, refresh_token=session["refresh_token"])))
+    return session
+
+
+def confirm_slot(printer_id, key, spool_uid):
+    """The user says the chipless spool spool_uid is in slot key: take that slot out of the
+    printer's load request in every TigerSpool, and leave it out of later sends."""
+    session = stored_session()
+    boxes = fetch_documents("Reading the TigerSpools", f"users/{session['uid']}/tigerspools",
+                            ["printer_ids"], session["id_token"])
+    writes = slot_removal_writes(session["uid"], boxes, printer_id, key)
+    if writes:
+        commit_writes("Updating the load request", writes, session["id_token"])
+    remember_confirmed(printer_id, key, spool_uid)
+    return f"TigerTag: slot {key} confirmed as loaded."
+
+
+def send_load_request(capability):
+    """Write the active printer's slots as a load request for TigerSpool. Returns the message."""
+    session = stored_session()
 
     config = json.loads(capability.get_config() or "{}")
     bundle = orca.host.preset_bundle()
@@ -1455,10 +1546,12 @@ def send_load_request(capability):
     except OSError:
         pass
     request = build_load_request(state["slots"], state["sliced"], list(slot_maps.get(printer_id, {})),
-                                 int(time.time() * 1000), time.strftime("%Y-%m-%d %H:%M"))
+                                 int(time.time() * 1000), time.strftime("%Y-%m-%d %H:%M"),
+                                 load_confirmed(printer_id))
     if not request["slots"]:
-        raise TigerTagError("No filament slot holds a TigerTag spool"
-                            + (" that this plate uses." if state["sliced"] else "."))
+        raise TigerTagError("No filament slot to ask for: none holds a TigerTag spool"
+                            + (" that this plate uses" if state["sliced"] else "")
+                            + " that is not confirmed as loaded.")
     label = names.get(printer_id, (None, printer_id))[1]
     writes = load_request_writes(session["uid"], boxes, printer_id, request)
     if not writes:
@@ -1559,6 +1652,11 @@ if orca is not None:
                 message, ok = work(StoredSession()), True
             except Exception as error:  # noqa: BLE001 - a thread must report every failure itself
                 message, ok = f"TigerTag: {error}", False
+                try:  # notifications vanish; this stays for a look later (no token is in it)
+                    write_text(os.path.join(state_dir(), LAST_ERROR_FILE),
+                               time.strftime("%Y-%m-%d %H:%M:%S ") + message + "\n\n" + traceback.format_exc())
+                except OSError:
+                    pass
             finally:
                 self._sync_lock.release()
             notify(message, error=not ok)
@@ -1591,6 +1689,10 @@ if orca is not None:
                 self.start_job("Syncing...", sync)
             elif command == "send":
                 self.start_job("Sending to TigerSpool...", send_load_request)
+            elif command == "confirm":
+                printer_id, key, spool_uid = message.get("printer_id"), message.get("key"), message.get("uid")
+                if all(isinstance(value, str) and value for value in (printer_id, key, spool_uid)):
+                    self.start_job(f"Confirming slot {key}...", lambda _session: confirm_slot(printer_id, key, spool_uid))
             elif command == "set_printer":
                 self.set_printer(message)
 

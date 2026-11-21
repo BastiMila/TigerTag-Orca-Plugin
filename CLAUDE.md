@@ -157,13 +157,22 @@ nozzle range and density in the filament tab.
      the presence document: a prototype to settle with the TigerTag developers,
      like the weight write-back.
    - Format: `{source: "orcaslicer", requested_at: ms, job, slots: {<printer
-     slot key>: {uid, uids: [one or both chips], preset, material, color,
-     grams_needed, rack: {id, name, level, position} | null, place}}}`. Only
-     slots holding a TigerTag spool; after a slice only the slots the plate
-     uses. The device reads `uids` (else `uid`), `material`, `rack` and
-     `requested_at` (ignored after 24 h); not `color`, `job`, `grams_needed`,
-     `place`. It builds the place from `rack` itself (`<name>, B5`; only `B5`
-     if its font cannot draw the name).
+     slot key>: {uid, uids: [one or both chips], preset, brand, material,
+     color, grams_needed, rack: {id, name, level, position} | null, place}}}`.
+     Only slots holding a TigerTag spool; after a slice only the slots the
+     plate uses. The device reads `uids` (else `uid`), `brand`, `material`,
+     `color` (a swatch), `rack` and `requested_at` (ignored after 24 h); not
+     `job`, `grams_needed`, `place` (asked for `brand` 2026-11-15). It builds
+     the place from `rack` itself (`<name>, B5`; only `B5` if its font cannot
+     draw the name).
+   - Spools without a chip (`TIGERDATA_...`) stay in the request; the device
+     shows "no TigerTag set yet" and does not warn, but can never see them
+     loaded. The tab therefore has "Loaded - remove from request" on such a
+     slot (written 2026-11-15, unit-tested, not run in Orca): it deletes
+     `load_requests.<printerId>.slots.<key>` in every box (a masked field
+     missing from `fields` is deleted) and records {printer: {key: uid}} in
+     `<data_dir>/tigertag_plugin/confirmed.json`; later sends leave that
+     slot out while the same spool is asked for in it.
    - The device reads it with the first full heartbeat after boot, then every
      second heartbeat (about a minute) while the screen is on. A slot is done
      when `slots.<printerId>.<key>.uid` is one of `uids`; the device writes
